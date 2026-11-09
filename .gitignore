@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+# dane prywatne
+include/config.h
+secrets.ini
+# notatki projektu (dane osobiste)
+CLAUDE.md
