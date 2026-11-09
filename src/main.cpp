@@ -84,7 +84,9 @@ bool conversionPending = false;
 
 Supla::ESPWifi wifi;
 Supla::Eeprom eeprom;
-Supla::LittleFsConfig configSupla;
+// Domyslny bufor 1024 B jest za maly dla 25 kanalow (termostaty z harmonogramem) - nadmiar byl po cichu
+// pomijany przy zapisie i po restarcie brakowalo WiFi ("Config incomplete").
+Supla::LittleFsConfig configSupla(8192);
 Supla::EspWebServer suplaServer;   // strona konfiguracyjna SUPLA (port 80)
 
 WebServer server(SERVICE_PORT);    // strona serwisowa
