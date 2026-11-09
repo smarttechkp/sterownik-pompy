@@ -4,7 +4,6 @@
 // - brak zadnego czujnika w grupie -> pompa stoi
 // - strona serwisowa http://<IP>:81 (podglad, reczne K1/K2, wgrywanie .bin na /update)
 // - strona konfiguracyjna SUPLA (WiFi, serwer, e-mail) zawsze dostepna pod http://<IP>
-// - po zmianie WiFi: jesli nowa siec nie dziala przez 5 min -> powrot do ostatniej dzialajacej
 //
 // Kanaly SUPLA (kolejnosc stala - zmiana wymaga ponownej rejestracji urzadzenia):
 //   0-9   termometry pokoi 1-10
@@ -41,6 +40,27 @@
 
 #include "config.h"
 
+// Wersja publikowana na GitHub (env:github) - plik .bin jest publiczny, wiec bez danych prywatnych.
+// Sterownik ma je juz zapisane w swojej pamieci z pierwszego wgrania.
+#ifdef PUBLIC_BUILD
+#undef WIFI_SSID
+#undef WIFI_PASS
+#undef SUPLA_SERVER
+#undef SUPLA_EMAIL
+#undef UPDATE_USER
+#undef UPDATE_PASS
+#define WIFI_SSID    ""
+#define WIFI_PASS    ""
+#define SUPLA_SERVER ""
+#define SUPLA_EMAIL  ""
+#define UPDATE_USER  ""
+#define UPDATE_PASS  ""
+#endif
+
+#ifndef FW_VERSION
+#define FW_VERSION "lokalna"
+#endif
+
 constexpr int N_SENSORS = 10;
 constexpr int GROUP_SIZE = 5;
 // Czujnik:                                 1   2   3   4   5   6   7   8   9  10
@@ -54,8 +74,6 @@ constexpr uint8_t CFG_BUTTON_GPIO = 0;                  // przycisk IO0
 constexpr unsigned long READ_INTERVAL_MS = 5000;
 constexpr unsigned long CONVERSION_MS    = 800;         // 12 bit = 750 ms
 constexpr unsigned long SERVICE_TIMEOUT_MS = 30UL * 60 * 1000;  // tryb reczny wylacza sie sam po 30 min
-constexpr unsigned long WIFI_GOOD_MS   = 60UL * 1000;       // po tylu ms polaczenia siec uznana za dzialajaca
-constexpr unsigned long WIFI_REVERT_MS = 5UL * 60 * 1000;   // po tylu ms bez polaczenia powrot do dzialajacej sieci
 
 OneWire ow[N_SENSORS];
 DallasTemperature dt[N_SENSORS];
@@ -74,10 +92,9 @@ HTTPUpdateServer httpUpdater;
 bool serverStarted = false;
 bool suplaWebStarted = false;
 
-Preferences wifiBackup;            // ostatnia dzialajaca siec WiFi
-bool wifiWasConnected = false;
-bool wifiBackupChecked = false;
-unsigned long wifiStateSince = 0;
+Preferences updateLogin;           // login/haslo do /update - zapamietane, bo wersja z GitHub ich nie zawiera
+String updateUser;
+String updatePass;
 
 Supla::Control::VirtualRelay *excluded[N_SENSORS];
 Supla::Control::HvacBase *hvac[N_RELAYS];
@@ -88,6 +105,67 @@ String lastUpdateResult = "-";
 bool serviceMode = false;
 bool serviceOn[N_RELAYS] = {false, false};
 unsigned long serviceStart = 0;
+
+// ------------------------------------------------------------ dziennik zdarzen (http://<IP>:81/log)
+// Pamiec RTC przetrwa restart programowy (nie przetrwa odlaczenia zasilania).
+constexpr int LOG_LINES = 40;
+constexpr int LOG_LINE_LEN = 72;
+constexpr uint32_t LOG_MAGIC = 0x50554D50;
+struct EventLog {
+  uint32_t magic;
+  uint32_t boot;
+  uint16_t next;
+  char lines[LOG_LINES][LOG_LINE_LEN];
+};
+RTC_NOINIT_ATTR EventLog eventLog;
+
+void logEvent(const char *fmt, ...) {
+  char msg[LOG_LINE_LEN - 16];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, args);
+  va_end(args);
+  snprintf(eventLog.lines[eventLog.next], LOG_LINE_LEN, "#%lu %6lus %s",
+           (unsigned long)eventLog.boot, millis() / 1000, msg);
+  eventLog.next = (eventLog.next + 1) % LOG_LINES;
+  Serial.printf("LOG: %s\n", msg);
+}
+
+void initEventLog() {
+  if (eventLog.magic != LOG_MAGIC || eventLog.next >= LOG_LINES) {
+    memset(&eventLog, 0, sizeof(eventLog));
+    eventLog.magic = LOG_MAGIC;
+  }
+  eventLog.boot++;
+  static const char *const reasons[] = {"nieznany", "wlaczenie zasilania", "zewnetrzny", "programowy",
+                                        "blad programu (panic)", "watchdog przerwan", "watchdog zadan",
+                                        "watchdog", "wybudzenie", "spadek napiecia (brownout)", "SDIO"};
+  int r = esp_reset_reason();
+  logEvent("START %s, przyczyna: %s", FW_VERSION, r < 11 ? reasons[r] : "inny");
+}
+
+// Zapisuje zmiany trybu SUPLA, statusu polaczenia i WiFi
+void watchState() {
+  static int lastMode = -1;
+  static int lastStatus = -1;
+  static int lastWifi = -1;
+  int mode = SuplaDevice.getDeviceMode();
+  if (mode != lastMode) {
+    lastMode = mode;
+    logEvent("tryb SUPLA: %d%s", mode, mode == Supla::DEVICE_MODE_CONFIG ? " (KONFIGURACJA)" : "");
+  }
+  int status = SuplaDevice.getCurrentStatus();
+  if (status != lastStatus) {
+    lastStatus = status;
+    logEvent("status SUPLA: %d", status);
+  }
+  int wifi = WiFi.status() == WL_CONNECTED ? 1 : 0;
+  if (wifi != lastWifi) {
+    lastWifi = wifi;
+    if (wifi) logEvent("WiFi polaczone, IP %s", WiFi.localIP().toString().c_str());
+    else logEvent("WiFi rozlaczone");
+  }
+}
 
 // ------------------------------------------------------------ czujniki
 void initSensor(int i) {
@@ -188,7 +266,7 @@ void updateFromGithub() {
     Serial.println("GitHub: " + lastUpdateResult);
     return;
   }
-  Serial.printf("GitHub: pobieranie %s\n", GITHUB_FW_URL);
+  logEvent("GitHub: pobieranie programu");
   WiFiClientSecure client;
   client.setInsecure();   // bez sprawdzania certyfikatu - plik i tak musi byc poprawnym programem ESP32
   httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GitHub przekierowuje na serwer z plikami
@@ -199,52 +277,7 @@ void updateFromGithub() {
   } else {
     lastUpdateResult = "brak nowego programu";
   }
-  Serial.println("GitHub: " + lastUpdateResult);
-}
-
-// ------------------------------------------------------------ powrot do dzialajacej sieci WiFi
-// Siec dzialajaca >= 1 min jest zapamietywana. Gdy przez 5 min nie ma polaczenia, a w konfiguracji SUPLA
-// jest inna siec niz zapamietana, przywracana jest zapamietana i sterownik sie restartuje.
-void wifiFallback() {
-  unsigned long now = millis();
-  if (SuplaDevice.getDeviceMode() == Supla::DEVICE_MODE_CONFIG) {
-    wifiStateSince = now;   // nie przeszkadzaj w trakcie konfiguracji przez przycisk IO0
-    return;
-  }
-  bool connected = WiFi.status() == WL_CONNECTED;
-  if (connected != wifiWasConnected) {
-    wifiWasConnected = connected;
-    wifiStateSince = now;
-    wifiBackupChecked = false;
-  }
-  auto cfg = Supla::Storage::ConfigInstance();
-  if (!cfg) return;
-
-  char ssid[128] = {};
-  char pass[128] = {};
-  cfg->getWiFiSSID(ssid);
-  cfg->getWiFiPassword(pass);
-  if (connected) {
-    if (!wifiBackupChecked && now - wifiStateSince >= WIFI_GOOD_MS) {
-      wifiBackupChecked = true;
-      if (wifiBackup.getString("ssid") != ssid || wifiBackup.getString("pass") != pass) {
-        wifiBackup.putString("ssid", ssid);
-        wifiBackup.putString("pass", pass);
-        Serial.printf("WiFi: zapamietano dzialajaca siec \"%s\"\n", ssid);
-      }
-    }
-  } else if (now - wifiStateSince >= WIFI_REVERT_MS) {
-    wifiStateSince = now;
-    String bSsid = wifiBackup.getString("ssid");
-    String bPass = wifiBackup.getString("pass");
-    if (bSsid.length() > 0 && (bSsid != ssid || bPass != pass)) {
-      Serial.printf("WiFi: brak polaczenia z \"%s\" - powrot do \"%s\"\n", ssid, bSsid.c_str());
-      cfg->setWiFiSSID(bSsid.c_str());
-      cfg->setWiFiPassword(bPass.c_str());
-      cfg->commit();
-      SuplaDevice.scheduleSoftRestart(1000);
-    }
-  }
+  logEvent("GitHub: %s", lastUpdateResult.c_str());
 }
 
 // ------------------------------------------------------------ strona serwisowa
@@ -295,9 +328,9 @@ void handleRoot() {
   }
   if (serviceMode) h += F("<a class='b' href='/auto'>Wroc do automatyki (termostaty)</a>");
   h += "<p>WiFi: " + String(WiFi.RSSI()) + " dBm &middot; IP: " + WiFi.localIP().toString() + "</p>";
-  h += "<p>Ostatnia aktualizacja z GitHub: " + lastUpdateResult + "</p>";
+  h += "<p>Wersja programu: " FW_VERSION " &middot; ostatnia aktualizacja z GitHub: " + lastUpdateResult + "</p>";
   h += "<p><a href='http://" + WiFi.localIP().toString() + "/'>Konfiguracja WiFi / SUPLA</a></p>";
-  h += F("<p><a href='/update'>Wgraj nowy program (.bin)</a></p></body></html>");
+  h += F("<p><a href='/update'>Wgraj nowy program (.bin)</a> &middot; <a href='/log'>Dziennik zdarzen</a></p></body></html>");
   server.send(200, "text/html; charset=utf-8", h);
 }
 
@@ -342,12 +375,27 @@ void handleJson() {
     if (i < N_SENSORS - 1) j += ",";
   }
   j += "],\"relays\":[" + String(pump[0]->isOn() ? 1 : 0) + "," + String(pump[1]->isOn() ? 1 : 0) +
-       "],\"service\":" + String(serviceMode ? 1 : 0) + "}";
+       "],\"service\":" + String(serviceMode ? 1 : 0) + ",\"version\":\"" FW_VERSION "\"}";
   server.send(200, "application/json", j);
 }
 
+void handleLog() {
+  String t;
+  t.reserve(LOG_LINES * LOG_LINE_LEN);
+  for (int k = 0; k < LOG_LINES; k++) {
+    const char *line = eventLog.lines[(eventLog.next + k) % LOG_LINES];
+    if (line[0]) {
+      t += line;
+      t += '\n';
+    }
+  }
+  server.send(200, "text/plain; charset=utf-8", t);
+}
+
 void startServiceServer() {
-  httpUpdater.setup(&server, "/update", UPDATE_USER, UPDATE_PASS);
+  server.on("/log", handleLog);
+  if (updatePass.length() == 0) Serial.println("UWAGA: brak hasla do /update - strona bez logowania");
+  httpUpdater.setup(&server, "/update", updateUser.c_str(), updatePass.c_str());
   server.on("/", handleRoot);
   server.on("/relay", handleRelay);
   server.on("/auto", handleAuto);
@@ -379,6 +427,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n=== Sterownik pompy - SUPLA ===");
+  initEventLog();
 
   for (int n = 0; n < N_RELAYS; n++) {
     pinMode(RELAY_PINS[n], OUTPUT);
@@ -395,7 +444,17 @@ void setup() {
   }
 
   presetConfig();
-  wifiBackup.begin("wifibak", false);
+
+  updateLogin.begin("update", false);
+  if (strlen(UPDATE_PASS) > 0 &&
+      (updateLogin.getString("user") != UPDATE_USER || updateLogin.getString("pass") != UPDATE_PASS)) {
+    updateLogin.putString("user", UPDATE_USER);
+    updateLogin.putString("pass", UPDATE_PASS);
+  }
+  updateUser = updateLogin.getString("user", UPDATE_USER);
+  updatePass = updateLogin.getString("pass", UPDATE_PASS);
+
+  eeprom.setStateSavePeriod(5000);   // stan przelacznikow zapisywany najpozniej 5 s po zmianie
 
   // Termostat potrzebuje zegara (harmonogram) - czas pobierany z serwera SUPLA
   new Supla::Clock;
@@ -442,6 +501,7 @@ void setup() {
   cfgButton->configureAsConfigButton(&SuplaDevice);
 
   SuplaDevice.setName(DEVICE_NAME);
+  SuplaDevice.setSwVersion(FW_VERSION);
   SuplaDevice.begin();
 }
 
@@ -455,8 +515,8 @@ void loop() {
     SuplaDevice.handleAction(0, Supla::START_LOCAL_WEB_SERVER);
     suplaWebStarted = true;
   }
-  wifiFallback();
   if (githubUpdate->isOn() && WiFi.status() == WL_CONNECTED) updateFromGithub();
+  watchState();
 
   unsigned long now = millis();
   if (serviceMode && now - serviceStart >= SERVICE_TIMEOUT_MS) {
