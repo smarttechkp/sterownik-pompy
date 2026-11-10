@@ -70,6 +70,8 @@ constexpr int N_RELAYS = 2;
 static const uint8_t RELAY_PINS[N_RELAYS] = {16, 17};   // K1, K2
 
 constexpr uint8_t CFG_BUTTON_GPIO = 0;                  // przycisk IO0
+constexpr uint8_t LED_GPIO = 23;                        // dioda na plytce (niepotwierdzone)
+constexpr bool LED_ACTIVE_HIGH = true;                  // true: stan wysoki zapala diode
 
 constexpr unsigned long READ_INTERVAL_MS = 5000;
 constexpr unsigned long CONVERSION_MS    = 800;         // 12 bit = 750 ms
@@ -425,6 +427,13 @@ void presetConfig() {
   cfg->commit();
 }
 
+// Dioda: miga gdy brak WiFi, swieci na stale gdy WiFi polaczone
+void updateLed() {
+  bool on = WiFi.status() == WL_CONNECTED || (millis() / 500) % 2;
+  digitalWrite(LED_GPIO, on == LED_ACTIVE_HIGH ? HIGH : LOW);
+}
+
+  
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -435,7 +444,8 @@ void setup() {
     pinMode(RELAY_PINS[n], OUTPUT);
     digitalWrite(RELAY_PINS[n], LOW);
   }
-
+  pinMode(LED_GPIO, OUTPUT);
+  
   for (int i = 0; i < N_SENSORS; i++) {
     temps[i] = NAN;
     ow[i].begin(SENSOR_PINS[i]);
@@ -519,7 +529,8 @@ void loop() {
   }
   if (githubUpdate->isOn() && WiFi.status() == WL_CONNECTED) updateFromGithub();
   watchState();
-
+  updateLed();
+  
   unsigned long now = millis();
   if (serviceMode && now - serviceStart >= SERVICE_TIMEOUT_MS) {
     serviceMode = false;
