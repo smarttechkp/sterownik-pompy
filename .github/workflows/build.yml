@@ -1,0 +1,64 @@
+# Buduje program po kazdej zmianie kodu i publikuje wydanie (Release) z plikiem firmware.bin.
+# Sterownik pobiera je przelacznikiem "Aktualizuj z GitHub" w SUPLA.
+# Mozna tez uruchomic recznie: zakladka Actions -> "Budowanie programu" -> Run workflow.
+name: Budowanie programu
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "include/**"
+      - "platformio.ini"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: "1.1.${{ github.run_number }}"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('platformio.ini') }}
+
+      - name: Instalacja PlatformIO
+        run: pip install platformio
+
+      # Pliki prywatne nie sa w repozytorium - wersja publiczna (PUBLIC_BUILD) i tak nie zawiera WiFi ani hasel
+      - name: Pliki konfiguracyjne ze wzorow
+        run: |
+          cp include/config.example.h include/config.h
+          cp secrets.example.ini secrets.ini
+
+      - name: Kompilacja
+        env:
+          PLATFORMIO_BUILD_FLAGS: '-DFW_VERSION=\"${{ env.VERSION }}\"'
+        run: pio run -e github
+
+      - name: Publikacja wydania
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: v${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          body: |
+            Zbudowane automatycznie z commita ${{ github.sha }}: ${{ github.event.head_commit.message }}
+            Aktualizacja: przelacznik "Aktualizuj z GitHub" w SUPLA.
+          files: .pio/build/github/firmware.bin

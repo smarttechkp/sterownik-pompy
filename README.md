@@ -34,5 +34,10 @@ z bootloaderem, partycjami i programem pod adres `0x0`.
 
 ## Aktualizacja z GitHub
 
-Do wydania (Release) dołącz plik `firmware.bin`, a potem włącz w SUPLA przełącznik „Aktualizuj z GitHub”.
-Sterownik pobiera `releases/latest/download/firmware.bin` i restartuje się.
+1. Zmień kod (np. w przeglądarce: plik → ikona ołówka → **Commit changes**).
+2. GitHub Actions sam zbuduje program i opublikuje wydanie `v1.1.N` z plikiem `firmware.bin`
+   (zakładka **Actions**, ok. 3–8 min; zielony znaczek = gotowe, czerwony = błąd kompilacji, wydania nie ma).
+3. W SUPLA włącz przełącznik „Aktualizuj z GitHub”. Sterownik pobiera `releases/latest/download/firmware.bin`
+   i restartuje się. Wersja programu jest widoczna na `http://<IP>:81`.
+
+Budowanie można też uruchomić ręcznie: **Actions → Budowanie programu → Run workflow**.
