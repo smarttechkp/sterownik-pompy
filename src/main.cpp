@@ -11,6 +11,7 @@
 //   20-21 termometr grupy 1 / grupy 2 (srednia)
 //   22-23 termostat K1 / K2
 //   24    "Aktualizuj z GitHub" - pobiera firmware.bin z GITHUB_FW_URL i restartuje sterownik
+//   25-26 praca pompy K1 / K2 (pomiar 0/1 bez jednostki - wykres do nakladania na temperatury)
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -37,6 +38,7 @@
 #include <supla/control/output_interface.h>
 #include <supla/control/virtual_relay.h>
 #include <supla/sensor/thermometer.h>
+#include <supla/sensor/general_purpose_measurement.h>
 
 #include "config.h"
 
@@ -256,6 +258,16 @@ class PumpOutput : public Supla::Control::OutputInterface {
 };
 
 PumpOutput *pump[N_RELAYS];
+
+// Stan przekaznika jako liczba 0/1 - SUPLA zapisuje historie i rysuje wykres
+class PumpState : public Supla::Sensor::GeneralPurposeMeasurement {
+ public:
+  explicit PumpState(int n) : n(n) {}
+  double getValue() override { return pump[n]->isOn() ? 1 : 0; }
+
+ private:
+  int n;
+};
 
 void applyRelays() {
   for (int n = 0; n < N_RELAYS; n++) pump[n]->apply();
@@ -508,6 +520,15 @@ void setup() {
   githubUpdate = new Supla::Control::VirtualRelay();
   githubUpdate->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
   githubUpdate->setDefaultStateOff();
+
+  // Kanaly 25-26: praca pompy K1, K2 (dodane na koncu - numery wczesniejszych kanalow bez zmian)
+  for (int n = 0; n < N_RELAYS; n++) {
+    auto state = new PumpState(n);
+    state->setInitialCaption(n == 0 ? "Praca pompy K1" : "Praca pompy K2");
+    state->setDefaultValuePrecision(0);
+    state->setDefaultRefreshIntervalMs(1000);
+    state->setKeepHistory(1, false);   // historia od razu wlaczona (wysylane przy pierwszej rejestracji kanalu)
+  }
 
   auto cfgButton = new Supla::Control::Button(CFG_BUTTON_GPIO, true, true);
   cfgButton->configureAsConfigButton(&SuplaDevice);
