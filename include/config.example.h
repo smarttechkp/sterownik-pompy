@@ -12,9 +12,9 @@
 #define SUPLA_EMAIL   "twoj@email.pl"
 
 // Nazwa urzadzenia w SUPLA Cloud
-#define DEVICE_NAME   "Sterownik pompy"
+#define DEVICE_NAME   "Sterownik ogrzewania"
 
-// Aktualizacja z GitHub (przelacznik "Aktualizuj z GitHub" w SUPLA).
+// Aktualizacja z GitHub - sprawdzana po kazdym starcie (przycisk "Restart" w SUPLA).
 // Plik firmware.bin dolaczony do najnowszego wydania (Release) w publicznym repozytorium.
 // Pusty adres = funkcja wylaczona.
 #define GITHUB_FW_URL "https://github.com/smarttechkp/sterownik-pompy/releases/latest/download/firmware.bin"

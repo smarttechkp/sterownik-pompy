@@ -1,25 +1,27 @@
-// Sterownik pompy obiegowej - ESP32 Relay X2 + 10x DS18B20 + SUPLA
-// - czujniki 1-5 -> termostat 1 -> K1, czujniki 6-10 -> termostat 2 -> K2
-// - temperatura grupy = srednia z czujnikow, ktore odpowiadaja i NIE sa wylaczone przelacznikiem w SUPLA
-// - brak zadnego czujnika w grupie -> pompa stoi
-// - strona serwisowa http://<IP>:81 (podglad, reczne K1/K2, wgrywanie .bin na /update)
+// Sterownik ogrzewania strefowego - ESP32 Relay X2 + 10x DS18B20 + MCP23017 + SUPLA
+// - kazdy pokoj: czujnik N -> termostat N -> przekaznik N -> silownik termoelektryczny NC 230 V strefy
+// - strefy 1-2: przekazniki K1/K2 na plytce, strefy 3-10: modul przekaznikow na ekspanderze MCP23017 (I2C)
+// - brak temperatury -> strefa zamknieta; restart / brak zasilania -> wszystkie strefy zamkniete
+// - po starcie sterownik sprawdza GitHub i sam pobiera nowsza wersje programu
+// - strona serwisowa http://<IP>:81 (podglad, reczne sterowanie strefami, wgrywanie .bin na /update)
 // - strona konfiguracyjna SUPLA (WiFi, serwer, e-mail) zawsze dostepna pod http://<IP>
 //
 // Kanaly SUPLA (kolejnosc stala - zmiana wymaga ponownej rejestracji urzadzenia):
 //   0-9   termometry pokoi 1-10
-//   10-19 przelaczniki "wylacz czujnik 1-10" (ZAL = czujnik nie jest brany pod uwage)
-//   20-21 termometr grupy 1 / grupy 2 (srednia)
-//   22-23 termostat K1 / K2
-//   24    "Aktualizuj z GitHub" - pobiera firmware.bin z GITHUB_FW_URL i restartuje sterownik
-//   25-26 praca pompy K1 / K2 (pomiar 0/1 bez jednostki - wykres do nakladania na temperatury)
+//   10-19 termostaty pokoi 1-10
+//   20    "Restart" - restart sterownika (po starcie sprawdza i pobiera nowa wersje z GitHub)
+//   21-30 praca silownikow 1-10 (pomiar 0/1 bez jednostki - wykres do nakladania na temperatury)
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Wire.h>
 #include <WebServer.h>
 #include <HTTPUpdateServer.h>
 #include <HTTPUpdate.h>
+#include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
+#include <esp_ota_ops.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
@@ -63,13 +65,22 @@
 #define FW_VERSION "lokalna"
 #endif
 
-constexpr int N_SENSORS = 10;
-constexpr int GROUP_SIZE = 5;
-// Czujnik:                                 1   2   3   4   5   6   7   8   9  10
-static const uint8_t SENSOR_PINS[N_SENSORS] = {4, 13, 14, 18, 19, 25, 26, 27, 32, 33};
+constexpr int N_ZONES = 10;
+// Pokoj/strefa:                            1   2   3   4   5   6   7   8   9  10
+static const uint8_t SENSOR_PINS[N_ZONES] = {4, 13, 14, 18, 19, 25, 26, 27, 32, 33};
 
-constexpr int N_RELAYS = 2;
-static const uint8_t RELAY_PINS[N_RELAYS] = {16, 17};   // K1, K2
+// Strefy 1-2: przekazniki na plytce (stan wysoki = zalaczony, potwierdzone)
+constexpr int N_BOARD_RELAYS = 2;
+static const uint8_t RELAY_PINS[N_BOARD_RELAYS] = {16, 17};   // K1, K2
+
+// Strefy 3-10: MCP23017, wyjscia GPA0-GPA7 -> wejscia IN1-IN8 modulu przekaznikow
+constexpr uint8_t I2C_SDA = 21;
+constexpr uint8_t I2C_SCL = 22;
+constexpr uint8_t MCP_ADDR = 0x20;                      // A0-A2 do GND
+constexpr uint8_t MCP_IODIRA = 0x00;
+constexpr uint8_t MCP_OLATA = 0x14;
+constexpr bool MODULE_ACTIVE_HIGH = false;              // false: modul zalacza przekaznik stanem niskim (typowe)
+constexpr unsigned long MCP_REFRESH_MS = 1000;          // ponowny zapis wyjsc / szukanie ekspandera
 
 constexpr uint8_t CFG_BUTTON_GPIO = 0;                  // przycisk IO0
 constexpr uint8_t LED_GPIO = 23;                        // dioda na plytce
@@ -78,19 +89,21 @@ constexpr bool LED_ACTIVE_HIGH = true;                  // true: stan wysoki zap
 constexpr unsigned long READ_INTERVAL_MS = 5000;
 constexpr unsigned long CONVERSION_MS    = 800;         // 12 bit = 750 ms
 constexpr unsigned long SERVICE_TIMEOUT_MS = 30UL * 60 * 1000;  // tryb reczny wylacza sie sam po 30 min
+constexpr unsigned long OTA_CONFIRM_MS = 60UL * 1000;           // nowa wersja zatwierdzana po 1 min pracy z WiFi
+constexpr unsigned long OTA_ROLLBACK_MS = 10UL * 60 * 1000;     // bez WiFi przez 10 min -> powrot do poprzedniej
 
-OneWire ow[N_SENSORS];
-DallasTemperature dt[N_SENSORS];
-float temps[N_SENSORS];
+OneWire ow[N_ZONES];
+DallasTemperature dt[N_ZONES];
+float temps[N_ZONES];
 
 unsigned long lastRequest = 0;
 bool conversionPending = false;
 
 Supla::ESPWifi wifi;
 Supla::Eeprom eeprom;
-// Domyslny bufor 1024 B jest za maly dla 25 kanalow (termostaty z harmonogramem) - nadmiar byl po cichu
-// pomijany przy zapisie i po restarcie brakowalo WiFi ("Config incomplete").
-Supla::LittleFsConfig configSupla(8192);
+// Bufor konfiguracji: domyslne 1024 B to za malo (nadmiar jest po cichu pomijany przy zapisie,
+// po restarcie brakuje WiFi). 10 termostatow z harmonogramem -> 16 kB.
+Supla::LittleFsConfig configSupla(16384);
 Supla::EspWebServer suplaServer;   // strona konfiguracyjna SUPLA (port 80)
 
 WebServer server(SERVICE_PORT);    // strona serwisowa
@@ -102,15 +115,23 @@ Preferences updateLogin;           // login/haslo do /update - zapamietane, bo w
 String updateUser;
 String updatePass;
 
-Supla::Control::VirtualRelay *excluded[N_SENSORS];
-Supla::Control::HvacBase *hvac[N_RELAYS];
-Supla::Control::VirtualRelay *githubUpdate;
+Preferences githubPrefs;           // wersja, ktorej instalacja sie nie powiodla (powrot do poprzedniej)
+
+Supla::Control::HvacBase *hvac[N_ZONES];
+Supla::Control::VirtualRelay *restartButton;
 String lastUpdateResult = "-";
+bool githubCheckDone = false;
+bool forceGithubUpdate = false;
+bool otaPendingVerify = false;
+unsigned long wifiSince = 0;
 
 // Tryb reczny ze strony serwisowej: przekazniki ustawiane recznie, termostaty ignorowane
 bool serviceMode = false;
-bool serviceOn[N_RELAYS] = {false, false};
+bool serviceOn[N_ZONES] = {};
 unsigned long serviceStart = 0;
+
+bool mcpOk = false;
+unsigned long lastMcpRefresh = 0;
 
 // ------------------------------------------------------------ dziennik zdarzen (http://<IP>:81/log)
 // Pamiec RTC przetrwa restart programowy (nie przetrwa odlaczenia zasilania).
@@ -168,6 +189,7 @@ void watchState() {
   int wifi = WiFi.status() == WL_CONNECTED ? 1 : 0;
   if (wifi != lastWifi) {
     lastWifi = wifi;
+    wifiSince = millis();
     if (wifi) logEvent("WiFi polaczone, IP %s", WiFi.localIP().toString().c_str());
     else logEvent("WiFi rozlaczone");
   }
@@ -181,11 +203,11 @@ void initSensor(int i) {
 }
 
 void requestAll() {
-  for (int i = 0; i < N_SENSORS; i++) dt[i].requestTemperatures();
+  for (int i = 0; i < N_ZONES; i++) dt[i].requestTemperatures();
 }
 
 void readAll() {
-  for (int i = 0; i < N_SENSORS; i++) {
+  for (int i = 0; i < N_ZONES; i++) {
     float t = dt[i].getTempCByIndex(0);
     if (t == DEVICE_DISCONNECTED_C) {
       temps[i] = NAN;
@@ -194,23 +216,6 @@ void readAll() {
       temps[i] = t;
     }
   }
-}
-
-bool isIncluded(int i) {
-  return !excluded[i]->isOn();
-}
-
-// Srednia z czujnikow grupy, ktore odpowiadaja i nie sa wylaczone; NAN gdy brak
-float groupAverage(int g) {
-  float sum = 0;
-  int n = 0;
-  for (int i = g * GROUP_SIZE; i < (g + 1) * GROUP_SIZE; i++) {
-    if (isIncluded(i) && !isnan(temps[i])) {
-      sum += temps[i];
-      n++;
-    }
-  }
-  return n > 0 ? sum / n : NAN;
 }
 
 class RoomThermometer : public Supla::Sensor::Thermometer {
@@ -224,23 +229,15 @@ class RoomThermometer : public Supla::Sensor::Thermometer {
   int idx;
 };
 
-class GroupThermometer : public Supla::Sensor::Thermometer {
- public:
-  explicit GroupThermometer(int group) : group(group) {}
-  double getValue() override {
-    float t = groupAverage(group);
-    return isnan(t) ? TEMPERATURE_NOT_AVAILABLE : t;
-  }
+// ------------------------------------------------------------ przekazniki / silowniki
+class ZoneOutput;
+ZoneOutput *zone[N_ZONES];
+void writeMcp();
 
- private:
-  int group;
-};
-
-// ------------------------------------------------------------ przekazniki
 // Wyjscie termostatu. W trybie recznym stan z termostatu jest zapamietywany, ale nie trafia na przekaznik.
-class PumpOutput : public Supla::Control::OutputInterface {
+class ZoneOutput : public Supla::Control::OutputInterface {
  public:
-  explicit PumpOutput(int n) : n(n) {}
+  explicit ZoneOutput(int n) : n(n) {}
   int getOutputValue() const override { return value; }
   void setOutputValue(int v) override {
     value = v;
@@ -249,7 +246,8 @@ class PumpOutput : public Supla::Control::OutputInterface {
   bool isOnOffOnly() const override { return true; }
   bool isOn() const { return serviceMode ? serviceOn[n] : value > 0; }
   void apply() {
-    digitalWrite(RELAY_PINS[n], isOn() ? HIGH : LOW);
+    if (n < N_BOARD_RELAYS) digitalWrite(RELAY_PINS[n], isOn() ? HIGH : LOW);
+    else writeMcp();
   }
 
  private:
@@ -257,31 +255,87 @@ class PumpOutput : public Supla::Control::OutputInterface {
   int value = 0;
 };
 
-PumpOutput *pump[N_RELAYS];
-
-// Stan przekaznika jako liczba 0/1 - SUPLA zapisuje historie i rysuje wykres
-class PumpState : public Supla::Sensor::GeneralPurposeMeasurement {
+// Stan silownika jako liczba 0/1 - SUPLA zapisuje historie i rysuje wykres
+class ZoneState : public Supla::Sensor::GeneralPurposeMeasurement {
  public:
-  explicit PumpState(int n) : n(n) {}
-  double getValue() override { return pump[n]->isOn() ? 1 : 0; }
+  explicit ZoneState(int n) : n(n) {}
+  double getValue() override { return zone[n]->isOn() ? 1 : 0; }
 
  private:
   int n;
 };
 
+// Bity GPA0-7 dla stref 3-10 (z uwzglednieniem poziomu zalaczania modulu)
+uint8_t mcpBits() {
+  uint8_t bits = 0;
+  for (int n = N_BOARD_RELAYS; n < N_ZONES; n++) {
+    bool on = zone[n] && zone[n]->isOn();
+    if (on == MODULE_ACTIVE_HIGH) bits |= 1 << (n - N_BOARD_RELAYS);
+  }
+  return bits;
+}
+
+bool mcpWrite(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MCP_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+void writeMcp() {
+  if (mcpOk && !mcpWrite(MCP_OLATA, mcpBits())) {
+    mcpOk = false;
+    logEvent("ekspander MCP23017: brak odpowiedzi");
+  }
+}
+
+// Szukanie ekspandera: najpierw stan wyjsc (wylaczone), dopiero potem piny jako wyjscia
+void detectMcp() {
+  if (mcpWrite(MCP_OLATA, mcpBits()) && mcpWrite(MCP_IODIRA, 0x00)) {
+    mcpOk = true;
+    logEvent("ekspander MCP23017: znaleziony");
+  }
+}
+
+void refreshMcp() {
+  if (mcpOk) writeMcp();     // zapis co sekunde - przywraca stan, gdyby ekspander sie zresetowal
+  else detectMcp();
+}
+
 void applyRelays() {
-  for (int n = 0; n < N_RELAYS; n++) pump[n]->apply();
+  for (int n = 0; n < N_ZONES; n++) zone[n]->apply();
 }
 
 // ------------------------------------------------------------ aktualizacja z GitHub
-// Wywolywane z loop() po zalaczeniu przelacznika w SUPLA. Przy sukcesie sterownik sam sie restartuje.
-void updateFromGithub() {
-  githubUpdate->turnOff();
-  if (strlen(GITHUB_FW_URL) == 0) {
-    lastUpdateResult = "brak adresu GITHUB_FW_URL w config.h";
-    Serial.println("GitHub: " + lastUpdateResult);
-    return;
+// Adres strony najnowszego wydania - z GITHUB_FW_URL ".../releases/latest/download/firmware.bin"
+String latestReleaseUrl() {
+  String url = GITHUB_FW_URL;
+  int p = url.indexOf("/releases/latest");
+  return p < 0 ? String() : url.substring(0, p) + "/releases/latest";
+}
+
+// Numer najnowszego wydania (np. "v1.1.7") - GitHub przekierowuje .../releases/latest na .../releases/tag/<numer>
+String latestReleaseTag() {
+  String url = latestReleaseUrl();
+  if (url.length() == 0) return String();
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  const char *headers[] = {"Location"};
+  http.collectHeaders(headers, 1);
+  String tag;
+  if (http.begin(client, url)) {
+    int code = http.GET();
+    String location = http.header("Location");
+    int p = location.lastIndexOf("/tag/");
+    if ((code == 301 || code == 302) && p >= 0) tag = location.substring(p + 5);
+    http.end();
   }
+  return tag;
+}
+
+void downloadFromGithub() {
   logEvent("GitHub: pobieranie, RAM %u kB (min %u kB)", ESP.getFreeHeap() / 1024, ESP.getMinFreeHeap() / 1024);
   WiFiClientSecure client;
   client.setInsecure();   // bez sprawdzania certyfikatu - plik i tak musi byc poprawnym programem ESP32
@@ -294,7 +348,66 @@ void updateFromGithub() {
   } else {
     lastUpdateResult = "brak nowego programu";
   }
+  githubPrefs.putString("failed", "");   // nieudane pobranie to nie wina wersji - mozna probowac ponownie
   logEvent("GitHub: %s", lastUpdateResult.c_str());
+}
+
+// Wywolywane raz po polaczeniu z WiFi (oraz na zadanie ze strony serwisowej).
+// Wersja lokalna (wgrana z laptopa) nie jest automatycznie nadpisywana.
+void checkGithub(bool force) {
+  if (strlen(GITHUB_FW_URL) == 0) {
+    lastUpdateResult = "brak adresu GITHUB_FW_URL w config.h";
+    return;
+  }
+  if (force) {
+    githubPrefs.putString("failed", "");
+    downloadFromGithub();
+    return;
+  }
+  if (strcmp(FW_VERSION, "lokalna") == 0) {
+    lastUpdateResult = "wersja lokalna - bez automatycznej aktualizacji";
+    logEvent("GitHub: %s", lastUpdateResult.c_str());
+    return;
+  }
+  String tag = latestReleaseTag();
+  if (tag.length() == 0) {
+    lastUpdateResult = "nie udalo sie sprawdzic wersji na GitHub";
+  } else if (tag == "v" FW_VERSION) {
+    lastUpdateResult = "aktualna (" + tag + ")";
+  } else if (tag == githubPrefs.getString("failed")) {
+    lastUpdateResult = tag + " pominieta - wczesniej nie dzialala (powrot do poprzedniej)";
+  } else {
+    logEvent("GitHub: nowa wersja %s", tag.c_str());
+    githubPrefs.putString("failed", tag);   // skasowane przez nowa wersje po zatwierdzeniu
+    downloadFromGithub();
+    return;
+  }
+  logEvent("GitHub: %s", lastUpdateResult.c_str());
+}
+
+// Nowa wersja programu startuje jako "do sprawdzenia". Jesli sie zawiesi / zrestartuje przed zatwierdzeniem,
+// bootloader wraca do poprzedniej. Zatwierdzenie: 1 min pracy z WiFi.
+extern "C" bool verifyRollbackLater() { return true; }   // nadpisuje funkcje z rdzenia Arduino (plik .c)
+
+void checkOtaPending() {
+  esp_ota_img_states_t state;
+  otaPendingVerify = esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) == ESP_OK &&
+                     state == ESP_OTA_IMG_PENDING_VERIFY;
+  if (otaPendingVerify) logEvent("nowa wersja - czeka na zatwierdzenie");
+}
+
+void confirmOta() {
+  if (!otaPendingVerify) return;
+  if (WiFi.status() == WL_CONNECTED && millis() - wifiSince >= OTA_CONFIRM_MS) {
+    esp_ota_mark_app_valid_cancel_rollback();
+    otaPendingVerify = false;
+    githubPrefs.putString("failed", "");
+    logEvent("nowa wersja zatwierdzona");
+  } else if (millis() >= OTA_ROLLBACK_MS) {
+    logEvent("nowa wersja bez WiFi przez 10 min - powrot do poprzedniej");
+    delay(100);
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+  }
 }
 
 // ------------------------------------------------------------ strona serwisowa
@@ -302,55 +415,56 @@ String fmtTemp(float t) {
   return isnan(t) ? String("brak") : String(t, 2) + " &deg;C";
 }
 
+String fmtSetpoint(int n) {
+  int16_t sp = hvac[n]->getTemperatureSetpointHeat();
+  return sp > INT16_MIN ? String(sp / 100.0, 1) + " &deg;C" : String("-");
+}
+
+String outputName(int n) {
+  if (n < N_BOARD_RELAYS) return "K" + String(n + 1) + " (GPIO" + String(RELAY_PINS[n]) + ")";
+  return "GPA" + String(n - N_BOARD_RELAYS);
+}
+
 void handleRoot() {
   String h;
-  h.reserve(4500);
+  h.reserve(8000);
   h += F("<!doctype html><html><head><meta charset='utf-8'>"
          "<meta name='viewport' content='width=device-width,initial-scale=1'>"
          "<meta http-equiv='refresh' content='5'>"
-         "<title>Sterownik pompy</title>"
-         "<style>body{font-family:sans-serif;margin:16px;max-width:520px}"
-         "table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px;text-align:left}"
-         ".off{color:#999}"
-         "a.b{display:inline-block;padding:8px 14px;margin:4px;border:1px solid #0f6e56;border-radius:6px;"
+         "<title>Sterownik ogrzewania</title>"
+         "<style>body{font-family:sans-serif;margin:16px;max-width:640px}"
+         "table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:5px;text-align:left}"
+         "a.b{display:inline-block;padding:5px 10px;margin:2px;border:1px solid #0f6e56;border-radius:6px;"
          "color:#0f6e56;text-decoration:none}.on{background:#0f6e56;color:#fff!important}"
          ".warn{background:#fff3cd;border:1px solid #e0b100;padding:8px;border-radius:6px}</style>"
-         "</head><body><h2>Sterownik pompy</h2>"
-         "<table><tr><th>Czujnik</th><th>GPIO</th><th>Temperatura</th><th>W SUPLA</th></tr>");
-  for (int i = 0; i < N_SENSORS; i++) {
-    bool inc = isIncluded(i);
-    h += "<tr" + String(inc ? "" : " class='off'") + "><td>" + String(i + 1) + "</td><td>" +
-         String(SENSOR_PINS[i]) + "</td><td>" + fmtTemp(temps[i]) + "</td><td>" +
-         (inc ? "liczony" : "wylaczony") + "</td></tr>";
-  }
-  h += F("</table><h3>Termostaty</h3><table><tr><th></th><th>Srednia</th><th>Zadana</th><th>Przekaznik</th></tr>");
-  for (int n = 0; n < N_RELAYS; n++) {
-    int16_t sp = hvac[n]->getTemperatureSetpointHeat();
-    h += "<tr><td>K" + String(n + 1) + " (czujniki " + String(n * GROUP_SIZE + 1) + "-" +
-         String((n + 1) * GROUP_SIZE) + ")</td><td>" + fmtTemp(groupAverage(n)) + "</td><td>" +
-         (sp > INT16_MIN ? String(sp / 100.0, 1) + " &deg;C" : String("-")) + "</td><td>" +
-         (pump[n]->isOn() ? "ZAL" : "WYL") + "</td></tr>";
-  }
-  h += F("</table><h3>Reczne sterowanie (do testow)</h3>");
+         "</head><body><h2>Sterownik ogrzewania</h2>");
   if (serviceMode) {
     h += F("<p class='warn'>Tryb reczny - termostaty nie steruja przekaznikami. "
-           "Wylaczy sie sam po 30 min lub po restarcie.</p>");
+           "Wylaczy sie sam po 30 min lub po restarcie. <a href='/auto'>Wroc do automatyki</a></p>");
   }
-  for (int n = 0; n < N_RELAYS; n++) {
+  h += F("<table><tr><th>Strefa</th><th>Temperatura</th><th>Zadana</th><th>Silownik</th><th>Wyjscie</th>"
+         "<th>Recznie</th></tr>");
+  for (int n = 0; n < N_ZONES; n++) {
     bool on = serviceMode && serviceOn[n];
-    h += "K" + String(n + 1) + " (GPIO" + String(RELAY_PINS[n]) + "): ";
-    h += "<a class='b" + String(on ? " on" : "") + "' href='/relay?n=" + String(n + 1) + "&s=1'>ZAL</a>";
-    h += "<a class='b" + String(serviceMode && !on ? " on" : "") + "' href='/relay?n=" + String(n + 1) +
-         "&s=0'>WYL</a><br>";
+    String nr = String(n + 1);
+    h += "<tr><td>" + nr + " (GPIO" + String(SENSOR_PINS[n]) + ")</td><td>" + fmtTemp(temps[n]) + "</td><td>" +
+         fmtSetpoint(n) + "</td><td>" + (zone[n]->isOn() ? "OTWARTY" : "zamkniety") + "</td><td>" +
+         outputName(n) + "</td><td>";
+    h += "<a class='b" + String(on ? " on" : "") + "' href='/relay?n=" + nr + "&s=1'>ZAL</a>";
+    h += "<a class='b" + String(serviceMode && !on ? " on" : "") + "' href='/relay?n=" + nr + "&s=0'>WYL</a>";
+    h += "</td></tr>";
   }
-  if (serviceMode) h += F("<a class='b' href='/auto'>Wroc do automatyki (termostaty)</a>");
+  h += F("</table>");
+  h += "<p>Ekspander MCP23017 (strefy 3-10): " + String(mcpOk ? "OK" : "BRAK - strefy 3-10 nie przelaczaja") + "</p>";
   h += "<p>WiFi: " + String(WiFi.RSSI()) + " dBm &middot; IP: " + WiFi.localIP().toString() + "</p>";
   h += "<p>Pamiec RAM: wolna " + String(ESP.getFreeHeap() / 1024) + " kB &middot; najmniej od startu " +
        String(ESP.getMinFreeHeap() / 1024) + " kB &middot; najwiekszy blok " +
        String(ESP.getMaxAllocHeap() / 1024) + " kB</p>";
-  h += "<p>Wersja programu: " FW_VERSION " &middot; ostatnia aktualizacja z GitHub: " + lastUpdateResult + "</p>";
+  h += "<p>Wersja programu: " FW_VERSION " &middot; GitHub: " + lastUpdateResult + "</p>";
   h += "<p><a href='http://" + WiFi.localIP().toString() + "/'>Konfiguracja WiFi / SUPLA</a></p>";
-  h += F("<p><a href='/update'>Wgraj nowy program (.bin)</a> &middot; <a href='/log'>Dziennik zdarzen</a></p></body></html>");
+  h += F("<p><a href='/update'>Wgraj nowy program (.bin)</a> &middot; <a href='/log'>Dziennik zdarzen</a> &middot; "
+         "<a href='/github' onclick=\"return confirm('Pobrac program z GitHub i zrestartowac?')\">"
+         "Wymus pobranie z GitHub</a></p></body></html>");
   server.send(200, "text/html; charset=utf-8", h);
 }
 
@@ -362,16 +476,16 @@ void redirectHome() {
 void handleRelay() {
   int n = server.arg("n").toInt();
   int s = server.arg("s").toInt();
-  if (n >= 1 && n <= N_RELAYS) {
+  if (n >= 1 && n <= N_ZONES) {
     if (!serviceMode) {
       // wejscie w tryb reczny - przekazniki startuja ze stanu, ktory ustawil termostat
-      for (int k = 0; k < N_RELAYS; k++) serviceOn[k] = pump[k]->isOn();
+      for (int k = 0; k < N_ZONES; k++) serviceOn[k] = zone[k]->isOn();
       serviceMode = true;
     }
     serviceStart = millis();
     serviceOn[n - 1] = (s == 1);
     applyRelays();
-    Serial.printf("Tryb reczny: K%d %s\n", n, s == 1 ? "ZAL" : "WYL");
+    Serial.printf("Tryb reczny: strefa %d %s\n", n, s == 1 ? "ZAL" : "WYL");
   }
   redirectHome();
 }
@@ -383,19 +497,33 @@ void handleAuto() {
   redirectHome();
 }
 
+void handleGithub() {
+  forceGithubUpdate = true;
+  server.send(200, "text/html; charset=utf-8",
+              "<meta http-equiv='refresh' content='60;url=/'>Pobieranie programu z GitHub - "
+              "sterownik zrestartuje sie po wgraniu (ok. 1 min).");
+}
+
+String jsonList(String (*item)(int)) {
+  String j = "[";
+  for (int n = 0; n < N_ZONES; n++) {
+    if (n) j += ",";
+    j += item(n);
+  }
+  return j + "]";
+}
+
 void handleJson() {
-  String j = "{\"temps\":[";
-  for (int i = 0; i < N_SENSORS; i++) {
-    j += isnan(temps[i]) ? String("null") : String(temps[i], 2);
-    if (i < N_SENSORS - 1) j += ",";
-  }
-  j += "],\"included\":[";
-  for (int i = 0; i < N_SENSORS; i++) {
-    j += isIncluded(i) ? "1" : "0";
-    if (i < N_SENSORS - 1) j += ",";
-  }
-  j += "],\"relays\":[" + String(pump[0]->isOn() ? 1 : 0) + "," + String(pump[1]->isOn() ? 1 : 0) +
-       "],\"service\":" + String(serviceMode ? 1 : 0) + ",\"version\":\"" FW_VERSION "\"";
+  String j = "{\"temps\":" + jsonList([](int n) {
+    return isnan(temps[n]) ? String("null") : String(temps[n], 2);
+  });
+  j += ",\"setpoints\":" + jsonList([](int n) {
+    int16_t sp = hvac[n]->getTemperatureSetpointHeat();
+    return sp > INT16_MIN ? String(sp / 100.0, 1) : String("null");
+  });
+  j += ",\"zones\":" + jsonList([](int n) { return String(zone[n]->isOn() ? 1 : 0); });
+  j += ",\"mcp\":" + String(mcpOk ? 1 : 0) + ",\"service\":" + String(serviceMode ? 1 : 0) +
+       ",\"version\":\"" FW_VERSION "\"";
   // pamiec RAM w bajtach: wolna teraz, najmniej wolnej od startu, najwiekszy wolny blok (HTTPS potrzebuje ok. 40-50 kB)
   j += ",\"heap_free\":" + String(ESP.getFreeHeap()) + ",\"heap_min\":" + String(ESP.getMinFreeHeap()) +
        ",\"heap_max_block\":" + String(ESP.getMaxAllocHeap()) + ",\"uptime_s\":" + String(millis() / 1000) + "}";
@@ -422,6 +550,7 @@ void startServiceServer() {
   server.on("/", handleRoot);
   server.on("/relay", handleRelay);
   server.on("/auto", handleAuto);
+  server.on("/github", handleGithub);
   server.on("/json", handleJson);
   server.begin();
   serverStarted = true;
@@ -452,20 +581,20 @@ void updateLed() {
   digitalWrite(LED_GPIO, on == LED_ACTIVE_HIGH ? HIGH : LOW);
 }
 
-  
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== Sterownik pompy - SUPLA ===");
+  Serial.println("\n=== Sterownik ogrzewania - SUPLA ===");
   initEventLog();
+  checkOtaPending();
 
-  for (int n = 0; n < N_RELAYS; n++) {
+  for (int n = 0; n < N_BOARD_RELAYS; n++) {
     pinMode(RELAY_PINS[n], OUTPUT);
     digitalWrite(RELAY_PINS[n], LOW);
   }
   pinMode(LED_GPIO, OUTPUT);
-  
-  for (int i = 0; i < N_SENSORS; i++) {
+
+  for (int i = 0; i < N_ZONES; i++) {
     temps[i] = NAN;
     ow[i].begin(SENSOR_PINS[i]);
     dt[i].setOneWire(&ow[i]);
@@ -484,8 +613,9 @@ void setup() {
   }
   updateUser = updateLogin.getString("user", UPDATE_USER);
   updatePass = updateLogin.getString("pass", UPDATE_PASS);
+  githubPrefs.begin("github", false);
 
-  eeprom.setStateSavePeriod(5000);   // stan przelacznikow zapisywany najpozniej 5 s po zmianie
+  eeprom.setStateSavePeriod(5000);
 
   // Termostat potrzebuje zegara (harmonogram) - czas pobierany z serwera SUPLA
   new Supla::Clock;
@@ -495,47 +625,53 @@ void setup() {
   new Supla::Html::WifiParameters;
   new Supla::Html::ProtocolParameters;
 
-  // Kanaly 0-9: termometry pokoi
-  for (int i = 0; i < N_SENSORS; i++) new RoomThermometer(i);
+  char caption[24];
 
-  // Kanaly 10-19: wylaczenie czujnika z liczenia sredniej (stan pamietany po restarcie)
-  for (int i = 0; i < N_SENSORS; i++) {
-    excluded[i] = new Supla::Control::VirtualRelay();
-    excluded[i]->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
-    excluded[i]->setDefaultStateRestore();
+  // Kanaly 0-9: termometry pokoi
+  for (int i = 0; i < N_ZONES; i++) {
+    auto t = new RoomThermometer(i);
+    snprintf(caption, sizeof(caption), "Pokój %d", i + 1);
+    t->setInitialCaption(caption);
   }
 
-  // Kanaly 20-21: srednia temperatura grupy
-  for (int g = 0; g < N_RELAYS; g++) new GroupThermometer(g);
-
-  // Kanaly 22-23: termostaty K1, K2
-  for (int n = 0; n < N_RELAYS; n++) {
-    pump[n] = new PumpOutput(n);
-    hvac[n] = new Supla::Control::HvacBase(pump[n]);
+  // Kanaly 10-19: termostaty pokoi. Minimalny czas wl./wyl. ustawia sie w SUPLA (domyslnie brak).
+  for (int n = 0; n < N_ZONES; n++) {
+    zone[n] = new ZoneOutput(n);
+    hvac[n] = new Supla::Control::HvacBase(zone[n]);
     hvac[n]->getChannel()->setDefault(SUPLA_CHANNELFNC_HVAC_THERMOSTAT);
     hvac[n]->setDefaultSubfunction(SUPLA_HVAC_SUBFUNCTION_HEAT);
-    hvac[n]->setMainThermometerChannelNo(20 + n);
-    // zalacz ponizej (zadana - histereza), wylacz po przekroczeniu zadanej
+    hvac[n]->setMainThermometerChannelNo(n);
+    // otworz strefe ponizej (zadana - histereza), zamknij po przekroczeniu zadanej
     hvac[n]->setUsedAlgorithm(SUPLA_HVAC_ALGORITHM_ON_OFF_SETPOINT_AT_MOST);
     hvac[n]->setTemperatureHisteresisMin(10);    // 0,1 st.C
     hvac[n]->setTemperatureHisteresisMax(500);   // 5 st.C
-    hvac[n]->setTemperatureHisteresis(50);       // domyslnie 0,5 st.C
-    hvac[n]->setOutputValueOnError(0);           // brak temperatury -> pompa stoi
+    hvac[n]->setTemperatureHisteresis(30);       // domyslnie 0,3 st.C
+    hvac[n]->setOutputValueOnError(0);           // brak temperatury -> strefa zamknieta
+    snprintf(caption, sizeof(caption), "Pokój %d", n + 1);
+    hvac[n]->setInitialCaption(caption);
   }
 
-  // Kanal 24: aktualizacja z GitHub (po restarcie zawsze wylaczony)
-  githubUpdate = new Supla::Control::VirtualRelay();
-  githubUpdate->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
-  githubUpdate->setDefaultStateOff();
+  // Kanal 20: restart (po restarcie zawsze wylaczony)
+  restartButton = new Supla::Control::VirtualRelay();
+  restartButton->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
+  restartButton->setDefaultStateOff();
+  restartButton->setInitialCaption("Restart (+ aktualizacja z GitHub)");
 
-  // Kanaly 25-26: praca pompy K1, K2 (dodane na koncu - numery wczesniejszych kanalow bez zmian)
-  for (int n = 0; n < N_RELAYS; n++) {
-    auto state = new PumpState(n);
-    state->setInitialCaption(n == 0 ? "Praca pompy K1" : "Praca pompy K2");
+  // Kanaly 21-30: praca silownikow
+  for (int n = 0; n < N_ZONES; n++) {
+    auto state = new ZoneState(n);
+    snprintf(caption, sizeof(caption), "Siłownik %d", n + 1);
+    state->setInitialCaption(caption);
     state->setDefaultValuePrecision(0);
     state->setDefaultRefreshIntervalMs(1000);
     state->setKeepHistory(1, false);   // historia od razu wlaczona (wysylane przy pierwszej rejestracji kanalu)
   }
+
+  // Ekspander - po utworzeniu stref (stan wyjsc liczony z zone[])
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setTimeOut(20);
+  detectMcp();
+  if (!mcpOk) logEvent("ekspander MCP23017: brak");
 
   auto cfgButton = new Supla::Control::Button(CFG_BUTTON_GPIO, true, true);
   cfgButton->configureAsConfigButton(&SuplaDevice);
@@ -547,19 +683,34 @@ void setup() {
 
 void loop() {
   SuplaDevice.iterate();
+  watchState();
 
-  if (!serverStarted && WiFi.status() == WL_CONNECTED) startServiceServer();
+  bool wifiOk = WiFi.status() == WL_CONNECTED;
+  if (!serverStarted && wifiOk) startServiceServer();
   if (serverStarted) server.handleClient();
-  if (!suplaWebStarted && WiFi.status() == WL_CONNECTED) {
+  if (!suplaWebStarted && wifiOk) {
     // strona konfiguracyjna SUPLA normalnie dziala tylko w trybie konfiguracji - wlaczamy ja na stale
     SuplaDevice.handleAction(0, Supla::START_LOCAL_WEB_SERVER);
     suplaWebStarted = true;
   }
-  if (githubUpdate->isOn() && WiFi.status() == WL_CONNECTED) updateFromGithub();
-  watchState();
+  if (wifiOk && (!githubCheckDone || forceGithubUpdate)) {
+    checkGithub(forceGithubUpdate);
+    githubCheckDone = true;
+    forceGithubUpdate = false;
+  }
+  if (restartButton->isOn()) {
+    restartButton->turnOff();
+    logEvent("restart z SUPLA");
+    SuplaDevice.scheduleSoftRestart(2000);   // chwila na wyslanie stanu przycisku do SUPLA
+  }
+  confirmOta();
   updateLed();
-  
+
   unsigned long now = millis();
+  if (now - lastMcpRefresh >= MCP_REFRESH_MS) {
+    lastMcpRefresh = now;
+    refreshMcp();
+  }
   if (serviceMode && now - serviceStart >= SERVICE_TIMEOUT_MS) {
     serviceMode = false;
     applyRelays();

@@ -1,27 +1,37 @@
-# Sterownik pompy obiegowej – ESP32 + 10× DS18B20 + SUPLA
+# Sterownik ogrzewania strefowego – ESP32 + 10× DS18B20 + SUPLA
 
-Program dla płytki „ESP32_Relay X2” (ESP32, 2 przekaźniki). Steruje dwiema pompami obiegowymi
-na podstawie temperatur w pokojach, z obsługą przez aplikację SUPLA.
+Program dla płytki „ESP32_Relay X2” (ESP32, 2 przekaźniki) z ekspanderem MCP23017 i modułem 8 przekaźników.
+Każdy pokój ma własny termostat w aplikacji SUPLA, który otwiera lub zamyka siłownik termoelektryczny
+(NC 230 V) swojej strefy.
 
-- czujniki 1–5 → termostat 1 → przekaźnik K1, czujniki 6–10 → termostat 2 → przekaźnik K2,
-- temperatura grupy = średnia z czujników, które odpowiadają i nie są wyłączone w SUPLA,
-- temperatura zadana i histereza osobno dla każdego termostatu (krok 0,1 °C),
-- brak działającego czujnika w grupie → pompa stoi.
+- czujnik N → termostat N → przekaźnik N → siłownik strefy N,
+- temperatura zadana i histereza osobno dla każdego pokoju (krok 0,1 °C), minimalny czas pracy – w ustawieniach termostatu w SUPLA,
+- brak temperatury → strefa zamknięta; restart / brak zasilania → wszystkie strefy zamknięte.
+
+## Wyjścia
+
+| Strefa | Wyjście |
+|---|---|
+| 1–2 | przekaźniki K1 (GPIO16) / K2 (GPIO17) na płytce |
+| 3–10 | MCP23017 (I2C: SDA GPIO21, SCL GPIO22, adres 0x20), GPA0–GPA7 → moduł przekaźników IN1–IN8 |
+
+Bez ekspandera program działa normalnie – strefy 3–10 są liczone i widoczne, ale nic nie przełączają.
+Poziom załączania modułu: `MODULE_ACTIVE_HIGH` w `src/main.cpp`.
 
 ## Kanały SUPLA
 
 | Nr | Kanał |
 |---|---|
-| 0–9 | termometry pokoi 1–10 |
-| 10–19 | „wyłącz czujnik N” (ZAŁ = czujnik pomijany w średniej) |
-| 20–21 | średnia temperatura grupy 1 / 2 |
-| 22–23 | termostat K1 / K2 |
-| 24 | „Aktualizuj z GitHub” |
+| 0–9 | termometry „Pokój 1–10” |
+| 10–19 | termostaty „Pokój 1–10” |
+| 20 | „Restart” (po restarcie sterownik sprawdza GitHub i pobiera nową wersję) |
+| 21–30 | „Siłownik 1–10” – praca 0/1 z historią (do wykresów) |
 
 ## Strony WWW sterownika
 
 - `http://<IP>` – konfiguracja WiFi i SUPLA,
-- `http://<IP>:81` – podgląd czujników, ręczne sterowanie K1/K2, `/update` – wgrywanie pliku `.bin`.
+- `http://<IP>:81` – podgląd stref, ręczne sterowanie, pamięć RAM, `/update` – wgrywanie pliku `.bin`,
+  `/json` – dane, `/log` – dziennik zdarzeń, `/github` – wymuszone pobranie programu z GitHub.
 
 ## Budowanie
 
@@ -37,7 +47,11 @@ z bootloaderem, partycjami i programem pod adres `0x0`.
 1. Zmień kod (np. w przeglądarce: plik → ikona ołówka → **Commit changes**).
 2. GitHub Actions sam zbuduje program i opublikuje wydanie `v1.1.N` z plikiem `firmware.bin`
    (zakładka **Actions**, ok. 3–8 min; zielony znaczek = gotowe, czerwony = błąd kompilacji, wydania nie ma).
-3. W SUPLA włącz przełącznik „Aktualizuj z GitHub”. Sterownik pobiera `releases/latest/download/firmware.bin`
-   i restartuje się. Wersja programu jest widoczna na `http://<IP>:81`.
+3. W SUPLA włącz „Restart”. Po starcie sterownik porównuje swoją wersję z najnowszym wydaniem
+   i jeśli jest inna – pobiera `releases/latest/download/firmware.bin` i restartuje się.
+   Wersja wgrana z komputera („lokalna”) nie jest nadpisywana automatycznie.
+4. Nowa wersja jest zatwierdzana po 1 min pracy z WiFi. Jeśli wcześniej się zawiesi lub zrestartuje
+   (albo przez 10 min nie połączy się z WiFi), sterownik wraca do poprzedniej wersji i pomija tę wersję
+   przy kolejnych restartach.
 
 Budowanie można też uruchomić ręcznie: **Actions → Budowanie programu → Run workflow**.
