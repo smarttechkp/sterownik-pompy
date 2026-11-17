@@ -77,13 +77,15 @@ static const char *const ZONE_NAMES[N_ZONES] = {"Salon", "Sypialnia", "Pokój", 
 constexpr int N_BOARD_RELAYS = 2;
 static const uint8_t RELAY_PINS[N_BOARD_RELAYS] = {16, 17};   // K1, K2
 
-// Strefy 3-10: MCP23017, wyjscia GPA0-GPA7 -> wejscia IN1-IN8 modulu przekaznikow
+// Strefy 3-10: MCP23017, wyjscia 0-7 (te same stany na porcie A i B - dowolny rzad pinow) -> IN1-IN8
+// modulu przekaznikow (wyzwalanie stanem niskim, wejscia modulu zasilane z 5 V).
+// Pin ekspandera: przekaznik WL = wyjscie ze stanem 0, WYL = wejscie (odlaczony, modul podciaga do 5 V).
+// Po wlaczeniu zasilania MCP23017 ma wszystkie piny jako wejscia -> strefy zamkniete, zanim ruszy program.
 constexpr uint8_t I2C_SDA = 21;
 constexpr uint8_t I2C_SCL = 22;
 constexpr uint8_t MCP_ADDR = 0x20;                      // A0-A2 do GND
-constexpr uint8_t MCP_IODIRA = 0x00;
-constexpr uint8_t MCP_OLATA = 0x14;
-constexpr bool MODULE_ACTIVE_HIGH = false;              // false: modul zalacza przekaznik stanem niskim (typowe)
+constexpr uint8_t MCP_IODIRA = 0x00;                    // IODIRA, IODIRB (kolejne adresy)
+constexpr uint8_t MCP_OLATA = 0x14;                     // OLATA, OLATB
 constexpr unsigned long MCP_REFRESH_MS = 1000;          // ponowny zapis wyjsc / szukanie ekspandera
 
 constexpr uint8_t CFG_BUTTON_GPIO = 0;                  // przycisk IO0
@@ -269,33 +271,38 @@ class ZoneState : public Supla::Sensor::GeneralPurposeMeasurement {
   int n;
 };
 
-// Bity GPA0-7 dla stref 3-10 (z uwzglednieniem poziomu zalaczania modulu)
-uint8_t mcpBits() {
-  uint8_t bits = 0;
+// Kierunek pinow 0-7 dla stref 3-10: bit 1 = wejscie (przekaznik WYL), 0 = wyjscie ze stanem 0 (ZAL)
+uint8_t mcpDirBits() {
+  uint8_t bits = 0xFF;
   for (int n = N_BOARD_RELAYS; n < N_ZONES; n++) {
-    bool on = zone[n] && zone[n]->isOn();
-    if (on == MODULE_ACTIVE_HIGH) bits |= 1 << (n - N_BOARD_RELAYS);
+    if (zone[n] && zone[n]->isOn()) bits &= ~(1 << (n - N_BOARD_RELAYS));
   }
   return bits;
 }
 
+// Zapis rejestru portu A i B (te same wartosci)
 bool mcpWrite(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(MCP_ADDR);
   Wire.write(reg);
   Wire.write(value);
+  Wire.write(value);
   return Wire.endTransmission() == 0;
 }
 
+// Najpierw stan wyjsc = 0 (gdyby ekspander sie zresetowal), potem kierunek pinow
+bool mcpWriteAll() {
+  return mcpWrite(MCP_OLATA, 0x00) && mcpWrite(MCP_IODIRA, mcpDirBits());
+}
+
 void writeMcp() {
-  if (mcpOk && !mcpWrite(MCP_OLATA, mcpBits())) {
+  if (mcpOk && !mcpWriteAll()) {
     mcpOk = false;
     logEvent("ekspander MCP23017: brak odpowiedzi");
   }
 }
 
-// Szukanie ekspandera: najpierw stan wyjsc (wylaczone), dopiero potem piny jako wyjscia
 void detectMcp() {
-  if (mcpWrite(MCP_OLATA, mcpBits()) && mcpWrite(MCP_IODIRA, 0x00)) {
+  if (mcpWriteAll()) {
     mcpOk = true;
     logEvent("ekspander MCP23017: znaleziony");
   }
@@ -426,7 +433,7 @@ String fmtSetpoint(int n) {
 
 String outputName(int n) {
   if (n < N_BOARD_RELAYS) return "K" + String(n + 1) + " (GPIO" + String(RELAY_PINS[n]) + ")";
-  return "GPA" + String(n - N_BOARD_RELAYS);
+  return "MCP " + String(n - N_BOARD_RELAYS) + " / IN" + String(n - N_BOARD_RELAYS + 1);
 }
 
 void handleRoot() {

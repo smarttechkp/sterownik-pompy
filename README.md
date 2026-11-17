@@ -13,10 +13,10 @@ Każdy pokój ma własny termostat w aplikacji SUPLA, który otwiera lub zamyka 
 | Strefa | Wyjście |
 |---|---|
 | 1–2 | przekaźniki K1 (GPIO16) / K2 (GPIO17) na płytce |
-| 3–10 | MCP23017 (I2C: SDA GPIO21, SCL GPIO22, adres 0x20), GPA0–GPA7 → moduł przekaźników IN1–IN8 |
+| 3–10 | MCP23017 (I2C: SDA GPIO21, SCL GPIO22, adres 0x20), piny A0–A7 lub B0–B7 (te same stany) → moduł przekaźników IN1–IN8 |
 
 Bez ekspandera program działa normalnie – strefy 3–10 są liczone i widoczne, ale nic nie przełączają.
-Poziom załączania modułu: `MODULE_ACTIVE_HIGH` w `src/main.cpp`.
+Moduł przekaźników wyzwalany stanem niskim, wejścia (VCC) zasilane z 5 V, zworka JD-VCC zdjęta. Pin ekspandera: ZAŁ = wyjście 0, WYŁ = wejście (odłączony).
 
 ## Kanały SUPLA
 
