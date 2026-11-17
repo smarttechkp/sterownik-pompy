@@ -1,7 +1,9 @@
 // Sterownik ogrzewania strefowego - ESP32 Relay X2 + 10x DS18B20 + MCP23017 + SUPLA
 // - kazdy pokoj: czujnik N -> termostat N -> przekaznik N -> silownik termoelektryczny NC 230 V strefy
-// - strefy 1-2: przekazniki K1/K2 na plytce, strefy 3-10: modul przekaznikow na ekspanderze MCP23017 (I2C)
-// - brak temperatury -> strefa zamknieta; restart / brak zasilania -> wszystkie strefy zamkniete
+// - strefy 1-2: przekazniki K1/K2 na plytce, strefy 3-10: modul przekaznikow 1 na porcie A ekspandera MCP23017 (I2C)
+// - pompa mieszkania 1 / 2 (modul przekaznikow 2 na porcie B): pracuje, gdy otwarty jest choc jeden silownik
+//   pokoi 1-5 / 6-10 (start z opoznieniem - silowniki termiczne otwieraja sie kilka minut)
+// - brak temperatury -> strefa zamknieta; restart / brak zasilania -> wszystkie strefy zamkniete, pompy stoja
 // - po starcie sterownik sprawdza GitHub i sam pobiera nowsza wersje programu
 // - strona serwisowa http://<IP>:81 (podglad, reczne sterowanie strefami, wgrywanie .bin na /update)
 // - strona konfiguracyjna SUPLA (WiFi, serwer, e-mail) zawsze dostepna pod http://<IP>
@@ -11,6 +13,7 @@
 //   10-19 termostaty pokoi 1-10
 //   20    "Restart" - restart sterownika (po starcie sprawdza i pobiera nowa wersje z GitHub)
 //   21-30 praca silownikow 1-10 (pomiar 0/1 bez jednostki - wykres do nakladania na temperatury)
+//   31-32 praca pompy mieszkania 1 / 2 (pomiar 0/1)
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -77,10 +80,17 @@ static const char *const ZONE_NAMES[N_ZONES] = {"Salon", "Sypialnia", "Pokój", 
 constexpr int N_BOARD_RELAYS = 2;
 static const uint8_t RELAY_PINS[N_BOARD_RELAYS] = {16, 17};   // K1, K2
 
-// Strefy 3-10: MCP23017, wyjscia 0-7 (te same stany na porcie A i B - dowolny rzad pinow) -> IN1-IN8
-// modulu przekaznikow (wyzwalanie stanem niskim, wejscia modulu zasilane z 5 V).
+// Pompy mieszkan: strefy 1-5 -> pompa M1, strefy 6-10 -> pompa M2
+constexpr int N_PUMPS = 2;
+constexpr int ZONES_PER_PUMP = N_ZONES / N_PUMPS;
+static const char *const PUMP_NAMES[N_PUMPS] = {"Pompa M1", "Pompa M2"};
+constexpr unsigned long PUMP_START_DELAY_MS = 2UL * 60 * 1000;  // pompa rusza 2 min po otwarciu pierwszego silownika
+
+// MCP23017: port A 0-7 -> modul przekaznikow 1 IN1-IN8 (strefy 3-10),
+//           port B 0-1 -> modul przekaznikow 2 IN1-IN2 (pompa M1, M2), B2-B7 wolne.
+// Moduly wyzwalane stanem niskim, wejscia modulow zasilane z 5 V.
 // Pin ekspandera: przekaznik WL = wyjscie ze stanem 0, WYL = wejscie (odlaczony, modul podciaga do 5 V).
-// Po wlaczeniu zasilania MCP23017 ma wszystkie piny jako wejscia -> strefy zamkniete, zanim ruszy program.
+// Po wlaczeniu zasilania MCP23017 ma wszystkie piny jako wejscia -> wszystko wylaczone, zanim ruszy program.
 constexpr uint8_t I2C_SDA = 21;
 constexpr uint8_t I2C_SCL = 22;
 constexpr uint8_t MCP_ADDR = 0x20;                      // A0-A2 do GND
@@ -131,9 +141,10 @@ bool forceGithubUpdate = false;
 bool otaPendingVerify = false;
 unsigned long wifiSince = 0;
 
-// Tryb reczny ze strony serwisowej: przekazniki ustawiane recznie, termostaty ignorowane
+// Tryb reczny ze strony serwisowej: przekazniki ustawiane recznie, termostaty i logika pomp ignorowane.
+// serviceOn: strefy 0-9, potem pompy.
 bool serviceMode = false;
-bool serviceOn[N_ZONES] = {};
+bool serviceOn[N_ZONES + N_PUMPS] = {};
 unsigned long serviceStart = 0;
 
 bool mcpOk = false;
@@ -251,6 +262,7 @@ class ZoneOutput : public Supla::Control::OutputInterface {
   }
   bool isOnOffOnly() const override { return true; }
   bool isOn() const { return serviceMode ? serviceOn[n] : value > 0; }
+  bool thermostatOn() const { return value > 0; }   // stan z termostatu (takze w trybie recznym)
   void apply() {
     if (n < N_BOARD_RELAYS) digitalWrite(RELAY_PINS[n], isOn() ? HIGH : LOW);
     else writeMcp();
@@ -271,8 +283,52 @@ class ZoneState : public Supla::Sensor::GeneralPurposeMeasurement {
   int n;
 };
 
-// Kierunek pinow 0-7 dla stref 3-10: bit 1 = wejscie (przekaznik WYL), 0 = wyjscie ze stanem 0 (ZAL)
-uint8_t mcpDirBits() {
+// ------------------------------------------------------------ pompy
+// Pompa mieszkania pracuje, gdy otwarty jest choc jeden silownik jego pokoi - po PUMP_START_DELAY_MS od otwarcia
+// pierwszego (silownik termiczny otwiera sie kilka minut). Zamkniecie ostatniego silownika zatrzymuje pompe od razu.
+bool pumpAuto[N_PUMPS] = {};
+unsigned long pumpDemandSince[N_PUMPS] = {};
+
+bool pumpIsOn(int p) { return serviceMode ? serviceOn[N_ZONES + p] : pumpAuto[p]; }
+
+bool anyZoneOpen(int p) {
+  for (int n = p * ZONES_PER_PUMP; n < (p + 1) * ZONES_PER_PUMP; n++) {
+    if (zone[n] && zone[n]->thermostatOn()) return true;
+  }
+  return false;
+}
+
+// Wywolywane w loop(); zwraca true, gdy stan ktorejs pompy (w trybie automatycznym) sie zmienil
+bool updatePumps() {
+  bool changed = false;
+  unsigned long now = millis();
+  for (int p = 0; p < N_PUMPS; p++) {
+    bool demand = anyZoneOpen(p);
+    if (!demand) pumpDemandSince[p] = 0;
+    else if (pumpDemandSince[p] == 0) pumpDemandSince[p] = now | 1;   // 0 = brak zapotrzebowania
+    bool on = demand && now - pumpDemandSince[p] >= PUMP_START_DELAY_MS;
+    if (on != pumpAuto[p]) {
+      pumpAuto[p] = on;
+      changed = true;
+      logEvent("%s %s", PUMP_NAMES[p], on ? "ZAL" : "WYL");
+    }
+  }
+  return changed;
+}
+
+// Stan pompy jako liczba 0/1 - historia w SUPLA
+class PumpState : public Supla::Sensor::GeneralPurposeMeasurement {
+ public:
+  explicit PumpState(int p) : p(p) {}
+  double getValue() override { return pumpIsOn(p) ? 1 : 0; }
+
+ private:
+  int p;
+};
+
+// Kierunek pinow: bit 1 = wejscie (przekaznik WYL), 0 = wyjscie ze stanem 0 (ZAL)
+// Port A 0-7: strefy 3-10
+uint8_t mcpDirA() {
   uint8_t bits = 0xFF;
   for (int n = N_BOARD_RELAYS; n < N_ZONES; n++) {
     if (zone[n] && zone[n]->isOn()) bits &= ~(1 << (n - N_BOARD_RELAYS));
@@ -280,18 +336,27 @@ uint8_t mcpDirBits() {
   return bits;
 }
 
-// Zapis rejestru portu A i B (te same wartosci)
-bool mcpWrite(uint8_t reg, uint8_t value) {
+// Port B 0-1: pompy
+uint8_t mcpDirB() {
+  uint8_t bits = 0xFF;
+  for (int p = 0; p < N_PUMPS; p++) {
+    if (pumpIsOn(p)) bits &= ~(1 << p);
+  }
+  return bits;
+}
+
+// Zapis rejestru portu A i B (kolejne adresy)
+bool mcpWrite(uint8_t reg, uint8_t a, uint8_t b) {
   Wire.beginTransmission(MCP_ADDR);
   Wire.write(reg);
-  Wire.write(value);
-  Wire.write(value);
+  Wire.write(a);
+  Wire.write(b);
   return Wire.endTransmission() == 0;
 }
 
 // Najpierw stan wyjsc = 0 (gdyby ekspander sie zresetowal), potem kierunek pinow
 bool mcpWriteAll() {
-  return mcpWrite(MCP_OLATA, 0x00) && mcpWrite(MCP_IODIRA, mcpDirBits());
+  return mcpWrite(MCP_OLATA, 0x00, 0x00) && mcpWrite(MCP_IODIRA, mcpDirA(), mcpDirB());
 }
 
 void writeMcp() {
@@ -433,7 +498,15 @@ String fmtSetpoint(int n) {
 
 String outputName(int n) {
   if (n < N_BOARD_RELAYS) return "K" + String(n + 1) + " (GPIO" + String(RELAY_PINS[n]) + ")";
-  return "MCP " + String(n - N_BOARD_RELAYS) + " / IN" + String(n - N_BOARD_RELAYS + 1);
+  return "MCP A" + String(n - N_BOARD_RELAYS) + " / modul 1 IN" + String(n - N_BOARD_RELAYS + 1);
+}
+
+// Przyciski ZAL/WYL trybu recznego; n = numer na stronie (strefy 1-10, pompy 11-12)
+String manualButtons(int n) {
+  bool on = serviceMode && serviceOn[n - 1];
+  String nr = String(n);
+  return "<a class='b" + String(on ? " on" : "") + "' href='/relay?n=" + nr + "&s=1'>ZAL</a>" +
+         "<a class='b" + String(serviceMode && !on ? " on" : "") + "' href='/relay?n=" + nr + "&s=0'>WYL</a>";
 }
 
 void handleRoot() {
@@ -450,24 +523,30 @@ void handleRoot() {
          ".warn{background:#fff3cd;border:1px solid #e0b100;padding:8px;border-radius:6px}</style>"
          "</head><body><h2>Sterownik ogrzewania</h2>");
   if (serviceMode) {
-    h += F("<p class='warn'>Tryb reczny - termostaty nie steruja przekaznikami. "
+    h += F("<p class='warn'>Tryb reczny - termostaty i logika pomp nie steruja przekaznikami. "
            "Wylaczy sie sam po 30 min lub po restarcie. <a href='/auto'>Wroc do automatyki</a></p>");
   }
   h += F("<table><tr><th>Strefa</th><th>Temperatura</th><th>Zadana</th><th>Silownik</th><th>Wyjscie</th>"
          "<th>Recznie</th></tr>");
   for (int n = 0; n < N_ZONES; n++) {
-    bool on = serviceMode && serviceOn[n];
-    String nr = String(n + 1);
-    h += "<tr><td>" + nr + " " + ZONE_NAMES[n] + " (M" + String(n < 5 ? 1 : 2) + ", GPIO" + String(SENSOR_PINS[n]) +
-         ")</td><td>" + fmtTemp(temps[n]) + "</td><td>" +
-         fmtSetpoint(n) + "</td><td>" + (zone[n]->isOn() ? "OTWARTY" : "zamkniety") + "</td><td>" +
-         outputName(n) + "</td><td>";
-    h += "<a class='b" + String(on ? " on" : "") + "' href='/relay?n=" + nr + "&s=1'>ZAL</a>";
-    h += "<a class='b" + String(serviceMode && !on ? " on" : "") + "' href='/relay?n=" + nr + "&s=0'>WYL</a>";
-    h += "</td></tr>";
+    h += "<tr><td>" + String(n + 1) + " " + ZONE_NAMES[n] + " (M" + String(n / ZONES_PER_PUMP + 1) + ", GPIO" +
+         String(SENSOR_PINS[n]) + ")</td><td>" + fmtTemp(temps[n]) + "</td><td>" + fmtSetpoint(n) + "</td><td>" +
+         (zone[n]->isOn() ? "OTWARTY" : "zamkniety") + "</td><td>" + outputName(n) + "</td><td>" +
+         manualButtons(n + 1) + "</td></tr>";
+  }
+  h += F("</table><h3>Pompy</h3><table><tr><th>Pompa</th><th>Stan</th><th>Wyjscie</th><th>Recznie</th></tr>");
+  for (int p = 0; p < N_PUMPS; p++) {
+    String state = pumpIsOn(p) ? String("PRACUJE") : String("stoi");
+    if (!serviceMode && !pumpAuto[p] && pumpDemandSince[p]) {
+      state += " (start za " + String((PUMP_START_DELAY_MS - (millis() - pumpDemandSince[p])) / 1000) + " s)";
+    }
+    h += "<tr><td>" + String(PUMP_NAMES[p]) + " (strefy " + String(p * ZONES_PER_PUMP + 1) + "-" +
+         String((p + 1) * ZONES_PER_PUMP) + ")</td><td>" + state + "</td><td>MCP B" + String(p) + " / modul 2 IN" +
+         String(p + 1) + "</td><td>" + manualButtons(N_ZONES + p + 1) + "</td></tr>";
   }
   h += F("</table>");
-  h += "<p>Ekspander MCP23017 (strefy 3-10): " + String(mcpOk ? "OK" : "BRAK - strefy 3-10 nie przelaczaja") + "</p>";
+  h += "<p>Ekspander MCP23017 (strefy 3-10, pompy): " +
+       String(mcpOk ? "OK" : "BRAK - strefy 3-10 i pompy nie przelaczaja") + "</p>";
   h += "<p>WiFi: " + String(WiFi.RSSI()) + " dBm &middot; IP: " + WiFi.localIP().toString() + "</p>";
   h += "<p>Pamiec RAM: wolna " + String(ESP.getFreeHeap() / 1024) + " kB &middot; najmniej od startu " +
        String(ESP.getMinFreeHeap() / 1024) + " kB &middot; najwiekszy blok " +
@@ -488,16 +567,17 @@ void redirectHome() {
 void handleRelay() {
   int n = server.arg("n").toInt();
   int s = server.arg("s").toInt();
-  if (n >= 1 && n <= N_ZONES) {
+  if (n >= 1 && n <= N_ZONES + N_PUMPS) {
     if (!serviceMode) {
-      // wejscie w tryb reczny - przekazniki startuja ze stanu, ktory ustawil termostat
+      // wejscie w tryb reczny - przekazniki startuja ze stanu, ktory ustawily termostaty i logika pomp
       for (int k = 0; k < N_ZONES; k++) serviceOn[k] = zone[k]->isOn();
+      for (int p = 0; p < N_PUMPS; p++) serviceOn[N_ZONES + p] = pumpAuto[p];
       serviceMode = true;
     }
     serviceStart = millis();
     serviceOn[n - 1] = (s == 1);
     applyRelays();
-    Serial.printf("Tryb reczny: strefa %d %s\n", n, s == 1 ? "ZAL" : "WYL");
+    Serial.printf("Tryb reczny: wyjscie %d %s\n", n, s == 1 ? "ZAL" : "WYL");
   }
   redirectHome();
 }
@@ -534,6 +614,9 @@ void handleJson() {
     return sp > INT16_MIN ? String(sp / 100.0, 1) : String("null");
   });
   j += ",\"zones\":" + jsonList([](int n) { return String(zone[n]->isOn() ? 1 : 0); });
+  j += ",\"pumps\":[";
+  for (int p = 0; p < N_PUMPS; p++) j += String(p ? "," : "") + (pumpIsOn(p) ? "1" : "0");
+  j += "]";
   j += ",\"mcp\":" + String(mcpOk ? 1 : 0) + ",\"service\":" + String(serviceMode ? 1 : 0) +
        ",\"version\":\"" FW_VERSION "\"";
   // pamiec RAM w bajtach: wolna teraz, najmniej wolnej od startu, najwiekszy wolny blok (HTTPS potrzebuje ok. 40-50 kB)
@@ -678,6 +761,15 @@ void setup() {
     state->setKeepHistory(1, false);   // historia od razu wlaczona (wysylane przy pierwszej rejestracji kanalu)
   }
 
+  // Kanaly 31-32: praca pomp (dodane na koncu - numery wczesniejszych kanalow bez zmian)
+  for (int p = 0; p < N_PUMPS; p++) {
+    auto state = new PumpState(p);
+    state->setInitialCaption(PUMP_NAMES[p]);
+    state->setDefaultValuePrecision(0);
+    state->setDefaultRefreshIntervalMs(1000);
+    state->setKeepHistory(1, false);
+  }
+
   // Ekspander - po utworzeniu stref (stan wyjsc liczony z zone[])
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setTimeOut(20);
@@ -716,6 +808,8 @@ void loop() {
   }
   confirmOta();
   updateLed();
+
+  if (updatePumps() && !serviceMode) writeMcp();
 
   unsigned long now = millis();
   if (now - lastMcpRefresh >= MCP_REFRESH_MS) {

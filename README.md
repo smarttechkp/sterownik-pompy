@@ -6,17 +6,20 @@ Każdy pokój ma własny termostat w aplikacji SUPLA, który otwiera lub zamyka 
 
 - czujnik N → termostat N → przekaźnik N → siłownik strefy N,
 - temperatura zadana i histereza osobno dla każdego pokoju (krok 0,1 °C), minimalny czas pracy – w ustawieniach termostatu w SUPLA,
-- brak temperatury → strefa zamknięta; restart / brak zasilania → wszystkie strefy zamknięte.
+- pompa mieszkania 1 / 2 pracuje, gdy otwarty jest choć jeden siłownik pokoi 1–5 / 6–10 (start 2 min po otwarciu
+  pierwszego siłownika, stop od razu po zamknięciu ostatniego),
+- brak temperatury → strefa zamknięta; restart / brak zasilania → wszystkie strefy zamknięte, pompy stoją.
 
 ## Wyjścia
 
 | Strefa | Wyjście |
 |---|---|
 | 1–2 | przekaźniki K1 (GPIO16) / K2 (GPIO17) na płytce |
-| 3–10 | MCP23017 (I2C: SDA GPIO21, SCL GPIO22, adres 0x20), piny A0–A7 lub B0–B7 (te same stany) → moduł przekaźników IN1–IN8 |
+| 3–10 | MCP23017 (I2C: SDA GPIO21, SCL GPIO22, adres 0x20), port A0–A7 → moduł przekaźników 1 IN1–IN8 |
+| pompy M1, M2 | MCP23017 port B0, B1 → moduł przekaźników 2 IN1, IN2 (B2–B7 wolne) |
 
-Bez ekspandera program działa normalnie – strefy 3–10 są liczone i widoczne, ale nic nie przełączają.
-Moduł przekaźników wyzwalany stanem niskim, wejścia (VCC) zasilane z 5 V, zworka JD-VCC zdjęta. Pin ekspandera: ZAŁ = wyjście 0, WYŁ = wejście (odłączony).
+Bez ekspandera program działa normalnie – strefy 3–10 i pompy są liczone i widoczne, ale nic nie przełączają.
+Moduły przekaźników wyzwalane stanem niskim, wejścia (VCC) zasilane z 5 V, zworki JD-VCC zdjęte. Pin ekspandera: ZAŁ = wyjście 0, WYŁ = wejście (odłączony).
 
 ## Kanały SUPLA
 
@@ -26,6 +29,7 @@ Moduł przekaźników wyzwalany stanem niskim, wejścia (VCC) zasilane z 5 V, zw
 | 10–19 | termostaty „<pokój>” |
 | 20 | „Restart” (po restarcie sterownik sprawdza GitHub i pobiera nową wersję) |
 | 21–30 | „<pokój> siłownik” – praca 0/1 z historią (do wykresów) |
+| 31–32 | „Pompa M1”, „Pompa M2” – praca 0/1 z historią |
 
 Pokoje (strefy 1–5 = mieszkanie 1, 6–10 = mieszkanie 2): Salon, Sypialnia, Pokój, Korytarz, Łazienka – `ZONE_NAMES` w `src/main.cpp`.
 Nazwy trafiają do SUPLA tylko przy pierwszej rejestracji urządzenia.
