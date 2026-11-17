@@ -72,7 +72,7 @@ constexpr int N_RELAYS = 2;
 static const uint8_t RELAY_PINS[N_RELAYS] = {16, 17};   // K1, K2
 
 constexpr uint8_t CFG_BUTTON_GPIO = 0;                  // przycisk IO0
-constexpr uint8_t LED_GPIO = 23;                        // dioda na plytce (niepotwierdzone)
+constexpr uint8_t LED_GPIO = 23;                        // dioda na plytce
 constexpr bool LED_ACTIVE_HIGH = true;                  // true: stan wysoki zapala diode
 
 constexpr unsigned long READ_INTERVAL_MS = 5000;
@@ -282,12 +282,13 @@ void updateFromGithub() {
     Serial.println("GitHub: " + lastUpdateResult);
     return;
   }
-  logEvent("GitHub: pobieranie programu");
+  logEvent("GitHub: pobieranie, RAM %u kB (min %u kB)", ESP.getFreeHeap() / 1024, ESP.getMinFreeHeap() / 1024);
   WiFiClientSecure client;
   client.setInsecure();   // bez sprawdzania certyfikatu - plik i tak musi byc poprawnym programem ESP32
   httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GitHub przekierowuje na serwer z plikami
   httpUpdate.rebootOnUpdate(true);
   t_httpUpdate_return ret = httpUpdate.update(client, GITHUB_FW_URL);
+  logEvent("GitHub: RAM min %u kB", ESP.getMinFreeHeap() / 1024);
   if (ret == HTTP_UPDATE_FAILED) {
     lastUpdateResult = "blad " + String(httpUpdate.getLastError()) + ": " + httpUpdate.getLastErrorString();
   } else {
@@ -344,6 +345,9 @@ void handleRoot() {
   }
   if (serviceMode) h += F("<a class='b' href='/auto'>Wroc do automatyki (termostaty)</a>");
   h += "<p>WiFi: " + String(WiFi.RSSI()) + " dBm &middot; IP: " + WiFi.localIP().toString() + "</p>";
+  h += "<p>Pamiec RAM: wolna " + String(ESP.getFreeHeap() / 1024) + " kB &middot; najmniej od startu " +
+       String(ESP.getMinFreeHeap() / 1024) + " kB &middot; najwiekszy blok " +
+       String(ESP.getMaxAllocHeap() / 1024) + " kB</p>";
   h += "<p>Wersja programu: " FW_VERSION " &middot; ostatnia aktualizacja z GitHub: " + lastUpdateResult + "</p>";
   h += "<p><a href='http://" + WiFi.localIP().toString() + "/'>Konfiguracja WiFi / SUPLA</a></p>";
   h += F("<p><a href='/update'>Wgraj nowy program (.bin)</a> &middot; <a href='/log'>Dziennik zdarzen</a></p></body></html>");
@@ -391,7 +395,10 @@ void handleJson() {
     if (i < N_SENSORS - 1) j += ",";
   }
   j += "],\"relays\":[" + String(pump[0]->isOn() ? 1 : 0) + "," + String(pump[1]->isOn() ? 1 : 0) +
-       "],\"service\":" + String(serviceMode ? 1 : 0) + ",\"version\":\"" FW_VERSION "\"}";
+       "],\"service\":" + String(serviceMode ? 1 : 0) + ",\"version\":\"" FW_VERSION "\"";
+  // pamiec RAM w bajtach: wolna teraz, najmniej wolnej od startu, najwiekszy wolny blok (HTTPS potrzebuje ok. 40-50 kB)
+  j += ",\"heap_free\":" + String(ESP.getFreeHeap()) + ",\"heap_min\":" + String(ESP.getMinFreeHeap()) +
+       ",\"heap_max_block\":" + String(ESP.getMaxAllocHeap()) + ",\"uptime_s\":" + String(millis() / 1000) + "}";
   server.send(200, "application/json", j);
 }
 
