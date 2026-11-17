@@ -22,10 +22,13 @@ Poziom załączania modułu: `MODULE_ACTIVE_HIGH` w `src/main.cpp`.
 
 | Nr | Kanał |
 |---|---|
-| 0–9 | termometry „Pokój 1–10” |
-| 10–19 | termostaty „Pokój 1–10” |
+| 0–9 | termometry „<pokój> temperatura” |
+| 10–19 | termostaty „<pokój>” |
 | 20 | „Restart” (po restarcie sterownik sprawdza GitHub i pobiera nową wersję) |
-| 21–30 | „Siłownik 1–10” – praca 0/1 z historią (do wykresów) |
+| 21–30 | „<pokój> siłownik” – praca 0/1 z historią (do wykresów) |
+
+Pokoje (strefy 1–5 = mieszkanie 1, 6–10 = mieszkanie 2): Salon, Sypialnia, Pokój, Korytarz, Łazienka – `ZONE_NAMES` w `src/main.cpp`.
+Nazwy trafiają do SUPLA tylko przy pierwszej rejestracji urządzenia.
 
 ## Strony WWW sterownika
 

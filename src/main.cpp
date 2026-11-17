@@ -68,6 +68,10 @@
 constexpr int N_ZONES = 10;
 // Pokoj/strefa:                            1   2   3   4   5   6   7   8   9  10
 static const uint8_t SENSOR_PINS[N_ZONES] = {4, 13, 14, 18, 19, 25, 26, 27, 32, 33};
+// Strefy 1-5: mieszkanie 1, strefy 6-10: mieszkanie 2 (rozroznienie przez lokalizacje w SUPLA).
+// Nazwy kanalow SUPLA bierze tylko przy pierwszej rejestracji - pozniej zmiana w aplikacji.
+static const char *const ZONE_NAMES[N_ZONES] = {"Salon", "Sypialnia", "Pokój", "Korytarz", "Łazienka",
+                                                "Salon", "Sypialnia", "Pokój", "Korytarz", "Łazienka"};
 
 // Strefy 1-2: przekazniki na plytce (stan wysoki = zalaczony, potwierdzone)
 constexpr int N_BOARD_RELAYS = 2;
@@ -447,7 +451,8 @@ void handleRoot() {
   for (int n = 0; n < N_ZONES; n++) {
     bool on = serviceMode && serviceOn[n];
     String nr = String(n + 1);
-    h += "<tr><td>" + nr + " (GPIO" + String(SENSOR_PINS[n]) + ")</td><td>" + fmtTemp(temps[n]) + "</td><td>" +
+    h += "<tr><td>" + nr + " " + ZONE_NAMES[n] + " (M" + String(n < 5 ? 1 : 2) + ", GPIO" + String(SENSOR_PINS[n]) +
+         ")</td><td>" + fmtTemp(temps[n]) + "</td><td>" +
          fmtSetpoint(n) + "</td><td>" + (zone[n]->isOn() ? "OTWARTY" : "zamkniety") + "</td><td>" +
          outputName(n) + "</td><td>";
     h += "<a class='b" + String(on ? " on" : "") + "' href='/relay?n=" + nr + "&s=1'>ZAL</a>";
@@ -625,12 +630,12 @@ void setup() {
   new Supla::Html::WifiParameters;
   new Supla::Html::ProtocolParameters;
 
-  char caption[24];
+  char caption[40];
 
   // Kanaly 0-9: termometry pokoi
   for (int i = 0; i < N_ZONES; i++) {
     auto t = new RoomThermometer(i);
-    snprintf(caption, sizeof(caption), "Pokój %d", i + 1);
+    snprintf(caption, sizeof(caption), "%s temperatura", ZONE_NAMES[i]);
     t->setInitialCaption(caption);
   }
 
@@ -647,8 +652,7 @@ void setup() {
     hvac[n]->setTemperatureHisteresisMax(500);   // 5 st.C
     hvac[n]->setTemperatureHisteresis(30);       // domyslnie 0,3 st.C
     hvac[n]->setOutputValueOnError(0);           // brak temperatury -> strefa zamknieta
-    snprintf(caption, sizeof(caption), "Pokój %d", n + 1);
-    hvac[n]->setInitialCaption(caption);
+    hvac[n]->setInitialCaption(ZONE_NAMES[n]);
   }
 
   // Kanal 20: restart (po restarcie zawsze wylaczony)
@@ -660,7 +664,7 @@ void setup() {
   // Kanaly 21-30: praca silownikow
   for (int n = 0; n < N_ZONES; n++) {
     auto state = new ZoneState(n);
-    snprintf(caption, sizeof(caption), "Siłownik %d", n + 1);
+    snprintf(caption, sizeof(caption), "%s siłownik", ZONE_NAMES[n]);
     state->setInitialCaption(caption);
     state->setDefaultValuePrecision(0);
     state->setDefaultRefreshIntervalMs(1000);
