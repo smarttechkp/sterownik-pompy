@@ -1,19 +1,19 @@
-// Sterownik ogrzewania strefowego - ESP32 Relay X2 + 10x DS18B20 + MCP23017 + SUPLA
+// Sterownik ogrzewania strefowego - ESP32 Relay X2 + 12x DS18B20 + MCP23017 + SUPLA
 // - kazdy pokoj: czujnik N -> termostat N -> przekaznik N -> silownik termoelektryczny NC 230 V strefy
-// - strefy 1-2: przekazniki K1/K2 na plytce, strefy 3-10: modul przekaznikow 1 na porcie A ekspandera MCP23017 (I2C)
-// - pompa mieszkania 1 / 2 (modul przekaznikow 2 na porcie B): pracuje, gdy otwarty jest choc jeden silownik
-//   pokoi 1-5 / 6-10 (start z opoznieniem - silowniki termiczne otwieraja sie kilka minut)
+// - strefy 1-8: modul przekaznikow 1 na porcie A ekspandera MCP23017 (I2C),
+//   strefy 9-12: modul przekaznikow 2 na porcie B (IN1-IN4)
+// - pompa mieszkania 1 / 2 (przekaznik K1 / K2 na plytce -> stycznik 12 V): pracuje, gdy grzeje choc jeden
+//   termostat pokoi 1-6 / 7-12 (start z krotkim opoznieniem, stop od razu)
 // - brak temperatury -> strefa zamknieta; restart / brak zasilania -> wszystkie strefy zamkniete, pompy stoja
 // - po starcie sterownik sprawdza GitHub i sam pobiera nowsza wersje programu
-// - strona serwisowa http://<IP>:81 (podglad, reczne sterowanie strefami, wgrywanie .bin na /update)
+// - strona serwisowa http://<IP>:81 (podglad, reczne sterowanie strefami i pompami, wgrywanie .bin na /update)
 // - strona konfiguracyjna SUPLA (WiFi, serwer, e-mail) zawsze dostepna pod http://<IP>
 //
 // Kanaly SUPLA (kolejnosc stala - zmiana wymaga ponownej rejestracji urzadzenia):
-//   0-9   termometry pokoi 1-10
-//   10-19 termostaty pokoi 1-10
-//   20    "Restart" - restart sterownika (po starcie sprawdza i pobiera nowa wersje z GitHub)
-//   21-30 praca silownikow 1-10 (pomiar 0/1 bez jednostki - wykres do nakladania na temperatury)
-//   31-32 praca pompy mieszkania 1 / 2 (pomiar 0/1)
+//   0-11  termometry pokoi 1-12
+//   12-23 termostaty pokoi 1-12
+//   24    "Restart" - restart sterownika (po starcie sprawdza i pobiera nowa wersje z GitHub)
+//   25-26 praca pompy mieszkania 1 / 2 (pomiar 0/1 bez jednostki - wykres do nakladania na temperatury)
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -68,26 +68,24 @@
 #define FW_VERSION "lokalna"
 #endif
 
-constexpr int N_ZONES = 10;
-// Pokoj/strefa:                            1   2   3   4   5   6   7   8   9  10
-static const uint8_t SENSOR_PINS[N_ZONES] = {4, 13, 14, 18, 19, 25, 26, 27, 32, 33};
-// Strefy 1-5: mieszkanie 1, strefy 6-10: mieszkanie 2 (rozroznienie przez lokalizacje w SUPLA).
+constexpr int N_ZONES = 12;
+// Pokoj/strefa (= numer czujnika na listwach): 1   2   3   4   5   6   7   8   9  10  11  12
+static const uint8_t SENSOR_PINS[N_ZONES] =    {4, 13, 14, 18, 19, 25, 26, 27, 32, 33, 5, 15};
+// Strefy 1-6: mieszkanie 1, strefy 7-12: mieszkanie 2 (rozroznienie przez lokalizacje w SUPLA).
 // Nazwy kanalow SUPLA bierze tylko przy pierwszej rejestracji - pozniej zmiana w aplikacji.
-static const char *const ZONE_NAMES[N_ZONES] = {"Salon", "Sypialnia", "Pokój", "Korytarz", "Łazienka",
-                                                "Salon", "Sypialnia", "Pokój", "Korytarz", "Łazienka"};
+static const char *const ZONE_NAMES[N_ZONES] = {"Salon", "Sypialnia", "Pokój", "Korytarz", "Łazienka", "Rezerwa",
+                                                "Salon", "Sypialnia", "Pokój", "Korytarz", "Łazienka", "Rezerwa"};
 
-// Strefy 1-2: przekazniki na plytce (stan wysoki = zalaczony, potwierdzone)
-constexpr int N_BOARD_RELAYS = 2;
-static const uint8_t RELAY_PINS[N_BOARD_RELAYS] = {16, 17};   // K1, K2
-
-// Pompy mieszkan: strefy 1-5 -> pompa M1, strefy 6-10 -> pompa M2
+// Pompy mieszkan: przekazniki na plytce (stan wysoki = zalaczony, potwierdzone) -> cewki stycznikow 12 V.
+// Strefy 1-6 -> pompa M1 (K1), strefy 7-12 -> pompa M2 (K2)
 constexpr int N_PUMPS = 2;
 constexpr int ZONES_PER_PUMP = N_ZONES / N_PUMPS;
+static const uint8_t PUMP_PINS[N_PUMPS] = {16, 17};   // K1, K2
 static const char *const PUMP_NAMES[N_PUMPS] = {"Pompa M1", "Pompa M2"};
-constexpr unsigned long PUMP_START_DELAY_MS = 2UL * 60 * 1000;  // pompa rusza 2 min po otwarciu pierwszego silownika
+constexpr unsigned long PUMP_START_DELAY_MS = 10UL * 1000;  // pompa rusza 10 s po starcie grzania pierwszej strefy
 
-// MCP23017: port A 0-7 -> modul przekaznikow 1 IN1-IN8 (strefy 3-10),
-//           port B 0-1 -> modul przekaznikow 2 IN1-IN2 (pompa M1, M2), B2-B7 wolne.
+// MCP23017: port A 0-7 -> modul przekaznikow 1 IN1-IN8 (strefy 1-8),
+//           port B 0-3 -> modul przekaznikow 2 IN1-IN4 (strefy 9-12), B4-B7 wolne.
 // Moduly wyzwalane stanem niskim, wejscia modulow zasilane z 5 V.
 // Pin ekspandera: przekaznik WL = wyjscie ze stanem 0, WYL = wejscie (odlaczony, modul podciaga do 5 V).
 // Po wlaczeniu zasilania MCP23017 ma wszystkie piny jako wejscia -> wszystko wylaczone, zanim ruszy program.
@@ -118,7 +116,7 @@ bool conversionPending = false;
 Supla::ESPWifi wifi;
 Supla::Eeprom eeprom;
 // Bufor konfiguracji: domyslne 1024 B to za malo (nadmiar jest po cichu pomijany przy zapisie,
-// po restarcie brakuje WiFi). 10 termostatow z harmonogramem -> 16 kB.
+// po restarcie brakuje WiFi). 12 termostatow z harmonogramem -> 16 kB.
 Supla::LittleFsConfig configSupla(16384);
 Supla::EspWebServer suplaServer;   // strona konfiguracyjna SUPLA (port 80)
 
@@ -142,7 +140,7 @@ bool otaPendingVerify = false;
 unsigned long wifiSince = 0;
 
 // Tryb reczny ze strony serwisowej: przekazniki ustawiane recznie, termostaty i logika pomp ignorowane.
-// serviceOn: strefy 0-9, potem pompy.
+// serviceOn: strefy 0-11, potem pompy.
 bool serviceMode = false;
 bool serviceOn[N_ZONES + N_PUMPS] = {};
 unsigned long serviceStart = 0;
@@ -258,34 +256,20 @@ class ZoneOutput : public Supla::Control::OutputInterface {
   int getOutputValue() const override { return value; }
   void setOutputValue(int v) override {
     value = v;
-    apply();
+    writeMcp();
   }
   bool isOnOffOnly() const override { return true; }
   bool isOn() const { return serviceMode ? serviceOn[n] : value > 0; }
   bool thermostatOn() const { return value > 0; }   // stan z termostatu (takze w trybie recznym)
-  void apply() {
-    if (n < N_BOARD_RELAYS) digitalWrite(RELAY_PINS[n], isOn() ? HIGH : LOW);
-    else writeMcp();
-  }
 
  private:
   int n;
   int value = 0;
 };
 
-// Stan silownika jako liczba 0/1 - SUPLA zapisuje historie i rysuje wykres
-class ZoneState : public Supla::Sensor::GeneralPurposeMeasurement {
- public:
-  explicit ZoneState(int n) : n(n) {}
-  double getValue() override { return zone[n]->isOn() ? 1 : 0; }
-
- private:
-  int n;
-};
-
 // ------------------------------------------------------------ pompy
-// Pompa mieszkania pracuje, gdy otwarty jest choc jeden silownik jego pokoi - po PUMP_START_DELAY_MS od otwarcia
-// pierwszego (silownik termiczny otwiera sie kilka minut). Zamkniecie ostatniego silownika zatrzymuje pompe od razu.
+// Pompa mieszkania pracuje, gdy grzeje choc jeden termostat jego pokoi - po PUMP_START_DELAY_MS od startu grzania
+// pierwszego. Koniec grzania ostatniego zatrzymuje pompe od razu.
 bool pumpAuto[N_PUMPS] = {};
 unsigned long pumpDemandSince[N_PUMPS] = {};
 
@@ -326,21 +310,16 @@ class PumpState : public Supla::Sensor::GeneralPurposeMeasurement {
   int p;
 };
 
-// Kierunek pinow: bit 1 = wejscie (przekaznik WYL), 0 = wyjscie ze stanem 0 (ZAL)
-// Port A 0-7: strefy 3-10
-uint8_t mcpDirA() {
-  uint8_t bits = 0xFF;
-  for (int n = N_BOARD_RELAYS; n < N_ZONES; n++) {
-    if (zone[n] && zone[n]->isOn()) bits &= ~(1 << (n - N_BOARD_RELAYS));
-  }
-  return bits;
+void applyPumps() {
+  for (int p = 0; p < N_PUMPS; p++) digitalWrite(PUMP_PINS[p], pumpIsOn(p) ? HIGH : LOW);
 }
 
-// Port B 0-1: pompy
-uint8_t mcpDirB() {
+// Kierunek pinow portu: bit 1 = wejscie (przekaznik WYL), 0 = wyjscie ze stanem 0 (ZAL)
+// Port A 0-7: strefy 1-8 (first = 0), port B 0-3: strefy 9-12 (first = 8)
+uint8_t mcpDir(int first) {
   uint8_t bits = 0xFF;
-  for (int p = 0; p < N_PUMPS; p++) {
-    if (pumpIsOn(p)) bits &= ~(1 << p);
+  for (int k = 0; k < 8 && first + k < N_ZONES; k++) {
+    if (zone[first + k] && zone[first + k]->isOn()) bits &= ~(1 << k);
   }
   return bits;
 }
@@ -356,7 +335,7 @@ bool mcpWrite(uint8_t reg, uint8_t a, uint8_t b) {
 
 // Najpierw stan wyjsc = 0 (gdyby ekspander sie zresetowal), potem kierunek pinow
 bool mcpWriteAll() {
-  return mcpWrite(MCP_OLATA, 0x00, 0x00) && mcpWrite(MCP_IODIRA, mcpDirA(), mcpDirB());
+  return mcpWrite(MCP_OLATA, 0x00, 0x00) && mcpWrite(MCP_IODIRA, mcpDir(0), mcpDir(8));
 }
 
 void writeMcp() {
@@ -379,7 +358,8 @@ void refreshMcp() {
 }
 
 void applyRelays() {
-  for (int n = 0; n < N_ZONES; n++) zone[n]->apply();
+  writeMcp();
+  applyPumps();
 }
 
 // ------------------------------------------------------------ aktualizacja z GitHub
@@ -497,11 +477,11 @@ String fmtSetpoint(int n) {
 }
 
 String outputName(int n) {
-  if (n < N_BOARD_RELAYS) return "K" + String(n + 1) + " (GPIO" + String(RELAY_PINS[n]) + ")";
-  return "MCP A" + String(n - N_BOARD_RELAYS) + " / modul 1 IN" + String(n - N_BOARD_RELAYS + 1);
+  if (n < 8) return "MCP A" + String(n) + " / modul 1 IN" + String(n + 1);
+  return "MCP B" + String(n - 8) + " / modul 2 IN" + String(n - 7);
 }
 
-// Przyciski ZAL/WYL trybu recznego; n = numer na stronie (strefy 1-10, pompy 11-12)
+// Przyciski ZAL/WYL trybu recznego; n = numer na stronie (strefy 1-12, pompy 13-14)
 String manualButtons(int n) {
   bool on = serviceMode && serviceOn[n - 1];
   String nr = String(n);
@@ -541,12 +521,12 @@ void handleRoot() {
       state += " (start za " + String((PUMP_START_DELAY_MS - (millis() - pumpDemandSince[p])) / 1000) + " s)";
     }
     h += "<tr><td>" + String(PUMP_NAMES[p]) + " (strefy " + String(p * ZONES_PER_PUMP + 1) + "-" +
-         String((p + 1) * ZONES_PER_PUMP) + ")</td><td>" + state + "</td><td>MCP B" + String(p) + " / modul 2 IN" +
-         String(p + 1) + "</td><td>" + manualButtons(N_ZONES + p + 1) + "</td></tr>";
+         String((p + 1) * ZONES_PER_PUMP) + ")</td><td>" + state + "</td><td>K" + String(p + 1) + " (GPIO" +
+         String(PUMP_PINS[p]) + ")</td><td>" + manualButtons(N_ZONES + p + 1) + "</td></tr>";
   }
   h += F("</table>");
-  h += "<p>Ekspander MCP23017 (strefy 3-10, pompy): " +
-       String(mcpOk ? "OK" : "BRAK - strefy 3-10 i pompy nie przelaczaja") + "</p>";
+  h += "<p>Ekspander MCP23017 (strefy 1-12): " +
+       String(mcpOk ? "OK" : "BRAK - strefy nie przelaczaja") + "</p>";
   h += "<p>WiFi: " + String(WiFi.RSSI()) + " dBm &middot; IP: " + WiFi.localIP().toString() + "</p>";
   h += "<p>Pamiec RAM: wolna " + String(ESP.getFreeHeap() / 1024) + " kB &middot; najmniej od startu " +
        String(ESP.getMinFreeHeap() / 1024) + " kB &middot; najwiekszy blok " +
@@ -683,9 +663,9 @@ void setup() {
   initEventLog();
   checkOtaPending();
 
-  for (int n = 0; n < N_BOARD_RELAYS; n++) {
-    pinMode(RELAY_PINS[n], OUTPUT);
-    digitalWrite(RELAY_PINS[n], LOW);
+  for (int p = 0; p < N_PUMPS; p++) {
+    pinMode(PUMP_PINS[p], OUTPUT);
+    digitalWrite(PUMP_PINS[p], LOW);
   }
   pinMode(LED_GPIO, OUTPUT);
 
@@ -722,14 +702,14 @@ void setup() {
 
   char caption[40];
 
-  // Kanaly 0-9: termometry pokoi
+  // Kanaly 0-11: termometry pokoi
   for (int i = 0; i < N_ZONES; i++) {
     auto t = new RoomThermometer(i);
     snprintf(caption, sizeof(caption), "%s temperatura", ZONE_NAMES[i]);
     t->setInitialCaption(caption);
   }
 
-  // Kanaly 10-19: termostaty pokoi. Minimalny czas wl./wyl. ustawia sie w SUPLA (domyslnie brak).
+  // Kanaly 12-23: termostaty pokoi. Minimalny czas wl./wyl. ustawia sie w SUPLA (domyslnie brak).
   for (int n = 0; n < N_ZONES; n++) {
     zone[n] = new ZoneOutput(n);
     hvac[n] = new Supla::Control::HvacBase(zone[n]);
@@ -745,29 +725,19 @@ void setup() {
     hvac[n]->setInitialCaption(ZONE_NAMES[n]);
   }
 
-  // Kanal 20: restart (po restarcie zawsze wylaczony)
+  // Kanal 24: restart (po restarcie zawsze wylaczony)
   restartButton = new Supla::Control::VirtualRelay();
   restartButton->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
   restartButton->setDefaultStateOff();
   restartButton->setInitialCaption("Restart (+ aktualizacja z GitHub)");
 
-  // Kanaly 21-30: praca silownikow
-  for (int n = 0; n < N_ZONES; n++) {
-    auto state = new ZoneState(n);
-    snprintf(caption, sizeof(caption), "%s siłownik", ZONE_NAMES[n]);
-    state->setInitialCaption(caption);
-    state->setDefaultValuePrecision(0);
-    state->setDefaultRefreshIntervalMs(1000);
-    state->setKeepHistory(1, false);   // historia od razu wlaczona (wysylane przy pierwszej rejestracji kanalu)
-  }
-
-  // Kanaly 31-32: praca pomp (dodane na koncu - numery wczesniejszych kanalow bez zmian)
+  // Kanaly 25-26: praca pomp
   for (int p = 0; p < N_PUMPS; p++) {
     auto state = new PumpState(p);
     state->setInitialCaption(PUMP_NAMES[p]);
     state->setDefaultValuePrecision(0);
     state->setDefaultRefreshIntervalMs(1000);
-    state->setKeepHistory(1, false);
+    state->setKeepHistory(1, false);   // historia od razu wlaczona (wysylane przy pierwszej rejestracji kanalu)
   }
 
   // Ekspander - po utworzeniu stref (stan wyjsc liczony z zone[])
@@ -809,7 +779,7 @@ void loop() {
   confirmOta();
   updateLed();
 
-  if (updatePumps() && !serviceMode) writeMcp();
+  if (updatePumps()) applyPumps();
 
   unsigned long now = millis();
   if (now - lastMcpRefresh >= MCP_REFRESH_MS) {

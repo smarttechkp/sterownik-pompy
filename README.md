@@ -1,43 +1,44 @@
-# Sterownik ogrzewania strefowego – ESP32 + 10× DS18B20 + SUPLA
+# Sterownik ogrzewania strefowego – ESP32 + 12× DS18B20 + SUPLA
 
-Program dla płytki „ESP32_Relay X2” (ESP32, 2 przekaźniki) z ekspanderem MCP23017 i modułem 8 przekaźników.
+Program dla płytki „ESP32_Relay X2” (ESP32, 2 przekaźniki) z ekspanderem MCP23017 i dwoma modułami 8 przekaźników.
 Każdy pokój ma własny termostat w aplikacji SUPLA, który otwiera lub zamyka siłownik termoelektryczny
 (NC 230 V) swojej strefy.
 
 - czujnik N → termostat N → przekaźnik N → siłownik strefy N,
 - temperatura zadana i histereza osobno dla każdego pokoju (krok 0,1 °C), minimalny czas pracy – w ustawieniach termostatu w SUPLA,
-- pompa mieszkania 1 / 2 pracuje, gdy otwarty jest choć jeden siłownik pokoi 1–5 / 6–10 (start 2 min po otwarciu
-  pierwszego siłownika, stop od razu po zamknięciu ostatniego),
+- pompa mieszkania 1 / 2 pracuje, gdy grzeje choć jeden termostat pokoi 1–6 / 7–12 (start 10 s po starcie grzania
+  pierwszego, stop od razu po zakończeniu grzania ostatniego); ręcznie tylko na stronie serwisowej (powrót po 30 min),
 - brak temperatury → strefa zamknięta; restart / brak zasilania → wszystkie strefy zamknięte, pompy stoją.
 
-## Wyjścia
+## Wejścia i wyjścia
 
-| Strefa | Wyjście |
-|---|---|
-| 1–2 | przekaźniki K1 (GPIO16) / K2 (GPIO17) na płytce |
-| 3–10 | MCP23017 (I2C: SDA GPIO21, SCL GPIO22, adres 0x20), port A0–A7 → moduł przekaźników 1 IN1–IN8 |
-| pompy M1, M2 | MCP23017 port B0, B1 → moduł przekaźników 2 IN1, IN2 (B2–B7 wolne) |
+| Strefa | Czujnik | Wyjście |
+|---|---|---|
+| 1–10 | GPIO 4, 13, 14, 18, 19, 25, 26, 27, 32, 33 | |
+| 11–12 | GPIO 5, 15 | |
+| 1–8 | | MCP23017 (I2C: SDA GPIO21, SCL GPIO22, adres 0x20), port A0–A7 → moduł przekaźników 1 IN1–IN8 |
+| 9–12 | | MCP23017 port B0–B3 → moduł przekaźników 2 IN1–IN4 (B4–B7 wolne) |
+| pompy M1, M2 | | przekaźniki K1 (GPIO16) / K2 (GPIO17) na płytce → cewki styczników 12 V |
 
-Bez ekspandera program działa normalnie – strefy 3–10 i pompy są liczone i widoczne, ale nic nie przełączają.
+Bez ekspandera program działa normalnie – strefy są liczone i widoczne, ale nic nie przełączają.
 Moduły przekaźników wyzwalane stanem niskim, wejścia (VCC) zasilane z 5 V, zworki JD-VCC zdjęte. Pin ekspandera: ZAŁ = wyjście 0, WYŁ = wejście (odłączony).
 
 ## Kanały SUPLA
 
 | Nr | Kanał |
 |---|---|
-| 0–9 | termometry „<pokój> temperatura” |
-| 10–19 | termostaty „<pokój>” |
-| 20 | „Restart” (po restarcie sterownik sprawdza GitHub i pobiera nową wersję) |
-| 21–30 | „<pokój> siłownik” – praca 0/1 z historią (do wykresów) |
-| 31–32 | „Pompa M1”, „Pompa M2” – praca 0/1 z historią |
+| 0–11 | termometry „<pokój> temperatura” |
+| 12–23 | termostaty „<pokój>” (stan siłownika widoczny w termostacie) |
+| 24 | „Restart” (po restarcie sterownik sprawdza GitHub i pobiera nową wersję) |
+| 25–26 | „Pompa M1”, „Pompa M2” – praca 0/1 z historią (do wykresów) |
 
-Pokoje (strefy 1–5 = mieszkanie 1, 6–10 = mieszkanie 2): Salon, Sypialnia, Pokój, Korytarz, Łazienka – `ZONE_NAMES` w `src/main.cpp`.
+Pokoje (strefy 1–6 = mieszkanie 1, 7–12 = mieszkanie 2): Salon, Sypialnia, Pokój, Korytarz, Łazienka, Rezerwa – `ZONE_NAMES` w `src/main.cpp`.
 Nazwy trafiają do SUPLA tylko przy pierwszej rejestracji urządzenia.
 
 ## Strony WWW sterownika
 
 - `http://<IP>` – konfiguracja WiFi i SUPLA,
-- `http://<IP>:81` – podgląd stref, ręczne sterowanie, pamięć RAM, `/update` – wgrywanie pliku `.bin`,
+- `http://<IP>:81` – podgląd stref, ręczne sterowanie strefami i pompami, pamięć RAM, `/update` – wgrywanie pliku `.bin`,
   `/json` – dane, `/log` – dziennik zdarzeń, `/github` – wymuszone pobranie programu z GitHub.
 
 ## Budowanie
