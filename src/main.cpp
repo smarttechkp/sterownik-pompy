@@ -1,7 +1,7 @@
 // Sterownik ogrzewania strefowego - ESP32 Relay X2 + 12x DS18B20 + MCP23017 + SUPLA
 // - kazdy pokoj: czujnik N -> termostat N -> przekaznik N -> silownik termoelektryczny NC 230 V strefy
-// - strefy 1-8: modul przekaznikow 1 na porcie A ekspandera MCP23017 (I2C),
-//   strefy 9-12: modul przekaznikow 2 na porcie B (IN1-IN4)
+// - strefy 1-6 (mieszkanie 1): modul przekaznikow 1 na porcie A ekspandera MCP23017 (I2C, IN1-IN6),
+//   strefy 7-12 (mieszkanie 2): modul przekaznikow 2 na porcie B (IN1-IN6)
 // - pompa mieszkania 1 / 2 (przekaznik K1 / K2 na plytce -> stycznik 12 V): pracuje, gdy grzeje choc jeden
 //   termostat pokoi 1-6 / 7-12 (start z krotkim opoznieniem, stop od razu)
 // - brak temperatury -> strefa zamknieta; restart / brak zasilania -> wszystkie strefy zamkniete, pompy stoja
@@ -84,8 +84,8 @@ static const uint8_t PUMP_PINS[N_PUMPS] = {16, 17};   // K1, K2
 static const char *const PUMP_NAMES[N_PUMPS] = {"Pompa M1", "Pompa M2"};
 constexpr unsigned long PUMP_START_DELAY_MS = 10UL * 1000;  // pompa rusza 10 s po starcie grzania pierwszej strefy
 
-// MCP23017: port A 0-7 -> modul przekaznikow 1 IN1-IN8 (strefy 1-8),
-//           port B 0-3 -> modul przekaznikow 2 IN1-IN4 (strefy 9-12), B4-B7 wolne.
+// MCP23017: port A 0-5 -> modul przekaznikow 1 IN1-IN6 (strefy 1-6, mieszkanie 1), A6-A7 wolne,
+//           port B 0-5 -> modul przekaznikow 2 IN1-IN6 (strefy 7-12, mieszkanie 2), B6-B7 wolne.
 // Moduly wyzwalane stanem niskim, wejscia modulow zasilane z 5 V.
 // Pin ekspandera: przekaznik WL = wyjscie ze stanem 0, WYL = wejscie (odlaczony, modul podciaga do 5 V).
 // Po wlaczeniu zasilania MCP23017 ma wszystkie piny jako wejscia -> wszystko wylaczone, zanim ruszy program.
@@ -315,10 +315,10 @@ void applyPumps() {
 }
 
 // Kierunek pinow portu: bit 1 = wejscie (przekaznik WYL), 0 = wyjscie ze stanem 0 (ZAL)
-// Port A 0-7: strefy 1-8 (first = 0), port B 0-3: strefy 9-12 (first = 8)
+// Port A 0-5: strefy 1-6 (first = 0), port B 0-5: strefy 7-12 (first = ZONES_PER_PUMP)
 uint8_t mcpDir(int first) {
   uint8_t bits = 0xFF;
-  for (int k = 0; k < 8 && first + k < N_ZONES; k++) {
+  for (int k = 0; k < ZONES_PER_PUMP && first + k < N_ZONES; k++) {
     if (zone[first + k] && zone[first + k]->isOn()) bits &= ~(1 << k);
   }
   return bits;
@@ -335,7 +335,7 @@ bool mcpWrite(uint8_t reg, uint8_t a, uint8_t b) {
 
 // Najpierw stan wyjsc = 0 (gdyby ekspander sie zresetowal), potem kierunek pinow
 bool mcpWriteAll() {
-  return mcpWrite(MCP_OLATA, 0x00, 0x00) && mcpWrite(MCP_IODIRA, mcpDir(0), mcpDir(8));
+  return mcpWrite(MCP_OLATA, 0x00, 0x00) && mcpWrite(MCP_IODIRA, mcpDir(0), mcpDir(ZONES_PER_PUMP));
 }
 
 void writeMcp() {
@@ -477,8 +477,9 @@ String fmtSetpoint(int n) {
 }
 
 String outputName(int n) {
-  if (n < 8) return "MCP A" + String(n) + " / modul 1 IN" + String(n + 1);
-  return "MCP B" + String(n - 8) + " / modul 2 IN" + String(n - 7);
+  int m = n / ZONES_PER_PUMP;          // 0 = port A / modul 1, 1 = port B / modul 2
+  int k = n % ZONES_PER_PUMP;
+  return String("MCP ") + (m == 0 ? "A" : "B") + String(k) + " / modul " + String(m + 1) + " IN" + String(k + 1);
 }
 
 // Przyciski ZAL/WYL trybu recznego; n = numer na stronie (strefy 1-12, pompy 13-14)
