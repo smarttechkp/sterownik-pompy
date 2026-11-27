@@ -16,8 +16,8 @@ Każdy pokój ma własny termostat w aplikacji SUPLA, który otwiera lub zamyka 
 |---|---|---|
 | 1–10 | GPIO 4, 13, 14, 18, 19, 25, 26, 27, 32, 33 | |
 | 11–12 | GPIO 5, 15 | |
-| 1–8 | | MCP23017 (I2C: SDA GPIO21, SCL GPIO22, adres 0x20), port A0–A7 → moduł przekaźników 1 IN1–IN8 |
-| 9–12 | | MCP23017 port B0–B3 → moduł przekaźników 2 IN1–IN4 (B4–B7 wolne) |
+| 1–6 (mieszkanie 1) | | MCP23017 (I2C: SDA GPIO21, SCL GPIO22, adres 0x20), port A0–A5 → moduł przekaźników 1 IN1–IN6 (A6–A7 wolne) |
+| 7–12 (mieszkanie 2) | | MCP23017 port B0–B5 → moduł przekaźników 2 IN1–IN6 (B6–B7 wolne) |
 | pompy M1, M2 | | przekaźniki K1 (GPIO16) / K2 (GPIO17) na płytce → cewki styczników 12 V |
 
 Bez ekspandera program działa normalnie – strefy są liczone i widoczne, ale nic nie przełączają.
